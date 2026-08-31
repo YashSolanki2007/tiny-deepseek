@@ -39,7 +39,7 @@ def main() -> None:
             {
                 "checkpoint": checkpoint_path,
                 "model": model.config.model_type,
-                "router": model.config.router_type if model.config.model_type == "dynamic" else "none",
+                "router": model.config.router_type if model.config.model_type == "sparse" else "none",
                 "tokens_per_second": args.tokens / max(elapsed, 1e-9),
                 "layers_per_token": compute_fraction * model.config.n_layers,
                 "compute_fraction": compute_fraction,

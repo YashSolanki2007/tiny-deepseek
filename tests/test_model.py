@@ -1,0 +1,137 @@
+from __future__ import annotations
+
+import torch
+
+from config import ModelConfig
+from model import TransformerBlock, apply_block_gate, build_model
+
+
+def tiny_config(**overrides) -> ModelConfig:
+    values = dict(
+        vocab_size=19, context_length=8, d_model=16, n_heads=4,
+        n_layers=3, d_ff=32, dropout=0.0, router_dim=8,
+        model_type="sparse",
+    )
+    values.update(overrides)
+    return ModelConfig(**values)
+
+
+def test_zero_gate_is_exact_identity() -> None:
+    x, candidate = torch.randn(2, 8, 16), torch.randn(2, 8, 16)
+    torch.testing.assert_close(
+        apply_block_gate(x, candidate, torch.zeros(2, 8, 1)), x, rtol=0, atol=0
+    )
+
+
+def test_one_gate_equals_normal_block_output() -> None:
+    block = TransformerBlock(tiny_config()).eval()
+    x = torch.randn(2, 8, 16)
+    candidate = block(x)
+    torch.testing.assert_close(
+        apply_block_gate(x, candidate, torch.ones(2, 8, 1)), candidate, rtol=0, atol=0
+    )
+
+
+def test_dense_model_has_no_routing_tensors() -> None:
+    output = build_model(tiny_config(model_type="dense"))(torch.randint(0, 19, (2, 8)))
+    assert output.soft_gates is None
+    assert output.hard_gates is None
+
+
+def test_sparse_output_shapes_and_hard_binary_forward() -> None:
+    for router_type in ("linear", "gru"):
+        output = build_model(tiny_config(router_type=router_type))(
+            torch.randint(0, 19, (2, 8)), routing_mode="gumbel"
+        )
+        assert output.soft_gates.shape == (2, 8, 3)
+        assert output.hard_gates.shape == (2, 8, 3)
+        assert output.route_logits.shape == (2, 8, 3, 2)
+        assert set(output.hard_gates.detach().unique().tolist()) <= {0.0, 1.0}
+
+
+def test_budget_controller_hits_exact_depth_when_fully_enabled() -> None:
+    model = build_model(tiny_config(router_type="linear")).eval()
+    token_ids = torch.randint(0, 19, (3, 8))
+    targets = torch.tensor([1.0, 2.0, 3.0])
+    output = model(
+        token_ids,
+        routing_mode="budget",
+        target_depths=targets,
+        exploration_epsilon=torch.ones(3),
+    )
+    torch.testing.assert_close(output.hard_gates.sum(dim=-1), targets[:, None].expand(3, 8))
+    assert torch.isfinite(output.behavior_log_probs).all()
+
+
+def test_budget_behavior_matches_policy_when_epsilon_is_zero() -> None:
+    model = build_model(tiny_config(router_type="linear")).eval()
+    token_ids = torch.randint(0, 19, (2, 8))
+    output = model(
+        token_ids,
+        routing_mode="budget",
+        target_depths=torch.tensor([1.0, 2.0]),
+        exploration_epsilon=0.0,
+    )
+    torch.testing.assert_close(output.behavior_log_probs, output.action_log_probs)
+
+
+def test_initial_soft_execute_probability_is_about_ninety_percent() -> None:
+    for router_type in ("linear", "gru"):
+        model = build_model(tiny_config(router_type=router_type)).eval()
+        output = model(torch.randint(0, 19, (8, 8)), routing_mode="greedy")
+        assert 0.88 < output.soft_gates.mean().item() < 0.92
+        assert output.hard_gates.mean().item() == 1.0
+
+
+def test_paper_router_uses_pre_normalized_layer_input_without_bias() -> None:
+    config = tiny_config(
+        router_type="linear", router_input_norm=True, router_bias=False,
+        initial_execute_probability=0.5, paper_reproduction=True,
+    )
+    model = build_model(config).eval()
+    token_ids = torch.randint(0, config.vocab_size, (2, config.context_length))
+    embedded = model.embed(token_ids)
+    expected = model.router.gate_heads[0](model.blocks[0].ln1(embedded))
+    output = model(token_ids, routing_mode="greedy")
+    torch.testing.assert_close(output.route_logits[:, :, 0], expected)
+    assert model.router.gate_heads[0].bias is None
+
+
+def test_paper_router_uses_standard_model_initialization_scale() -> None:
+    torch.manual_seed(22)
+    model = build_model(
+        tiny_config(
+            router_type="linear", router_bias=False,
+            initial_execute_probability=0.5, paper_reproduction=True,
+        )
+    )
+    std = model.router.gate_heads[0].weight.std().item()
+    assert 0.012 < std < 0.028
+
+
+def test_skipped_token_remains_context_for_active_attention_query() -> None:
+    torch.manual_seed(12)
+    block = TransformerBlock(tiny_config()).eval()
+    x = torch.randn(1, 2, 16)
+    gate = torch.tensor([[[0.0], [1.0]]])
+    output = apply_block_gate(x, block(x), gate)
+    changed_context = x.clone()
+    changed_context[:, 0, 0] += 3.0
+    changed_output = apply_block_gate(changed_context, block(changed_context), gate)
+    torch.testing.assert_close(output[:, 0], x[:, 0], rtol=0, atol=0)
+    assert not torch.allclose(output[:, 1], changed_output[:, 1])
+
+
+def test_sparse_greedy_block_matches_dense_masked_semantics() -> None:
+    torch.manual_seed(31)
+    block = TransformerBlock(tiny_config()).eval()
+    x = torch.randn(2, 8, 16)
+    active = torch.tensor(
+        [
+            [False, True, False, True, True, False, True, False],
+            [True, False, False, True, False, True, False, True],
+        ]
+    )
+    dense_masked = apply_block_gate(x, block(x), active.unsqueeze(-1).float())
+    sparse = block.forward_selected(x, active)
+    torch.testing.assert_close(sparse, dense_masked, rtol=1e-5, atol=1e-6)

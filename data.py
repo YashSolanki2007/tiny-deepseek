@@ -61,10 +61,16 @@ class TinyShakespeareData:
         return "".join(self.itos[i] for i in ids)
 
     def get_batch(
-        self, split: str, batch_size: int, device: torch.device | str
+        self,
+        split: str,
+        batch_size: int,
+        device: torch.device | str,
+        generator: torch.Generator | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         source = self.train_data if split == "train" else self.val_data
-        starts = torch.randint(0, len(source) - self.context_length, (batch_size,))
+        starts = torch.randint(
+            0, len(source) - self.context_length, (batch_size,), generator=generator
+        )
         x = torch.stack([source[i : i + self.context_length] for i in starts])
         y = torch.stack([source[i + 1 : i + self.context_length + 1] for i in starts])
         return x.to(device), y.to(device)

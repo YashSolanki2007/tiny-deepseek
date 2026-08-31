@@ -17,6 +17,40 @@ def display_character(character: str) -> str:
 
 
 @torch.inference_mode()
+def save_routing_heatmap(model, stoi, text: str, mode: str, output_path: str | Path) -> Path:
+    if model.config.model_type != "sparse":
+        raise ValueError("Routing visualization requires a sparse checkpoint")
+    unknown = sorted(set(text) - stoi.keys())
+    if unknown:
+        raise ValueError(f"Text contains unknown characters: {unknown!r}")
+    text = text[-model.config.context_length :]
+    device = next(model.parameters()).device
+    ids = torch.tensor([[stoi[ch] for ch in text]], dtype=torch.long, device=device)
+    model.eval()
+    output = model(ids, routing_mode="greedy")
+    gates = output.soft_gates if mode == "soft" else output.hard_gates
+    matrix = gates[0].transpose(0, 1).float().cpu().numpy()
+    width = max(10.0, 0.32 * len(text))
+    height = max(3.5, 0.55 * model.config.n_layers)
+    fig, axis = plt.subplots(figsize=(width, height))
+    image = axis.imshow(matrix, aspect="auto", interpolation="nearest", vmin=0, vmax=1, cmap="viridis")
+    axis.set_yticks(np.arange(model.config.n_layers))
+    axis.set_yticklabels([f"Layer {i}" for i in range(model.config.n_layers)])
+    axis.set_xticks(np.arange(len(text)))
+    axis.set_xticklabels([display_character(ch) for ch in text], fontsize=8)
+    axis.set_xlabel("Input character")
+    axis.set_title(f"{mode.capitalize()} dynamic-depth gates")
+    fig.colorbar(image, ax=axis, label="Gate value", fraction=0.025, pad=0.02)
+    fig.tight_layout()
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    fig.savefig(output_path.with_suffix(".pdf"), bbox_inches="tight")
+    plt.close(fig)
+    return output_path
+
+
+@torch.inference_mode()
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
@@ -28,38 +62,14 @@ def main() -> None:
 
     device = select_device(args.device)
     model, checkpoint = load_checkpoint(args.checkpoint, device)
-    if model.config.model_type != "dynamic":
-        raise ValueError("Routing visualization requires a dynamic checkpoint")
     stoi = checkpoint["stoi"]
-    unknown = sorted(set(args.text) - stoi.keys())
-    if unknown:
-        raise ValueError(f"Text contains unknown characters: {unknown!r}")
-    text = args.text[-model.config.context_length :]
-    ids = torch.tensor([[stoi[ch] for ch in text]], dtype=torch.long, device=device)
-    model.eval()
-    output = model(ids)
-    gates = output.soft_gates if args.mode == "soft" else output.hard_gates
-    matrix = gates[0].transpose(0, 1).float().cpu().numpy()
-
-    width = max(10.0, 0.32 * len(text))
-    height = max(3.5, 0.55 * model.config.n_layers)
-    fig, axis = plt.subplots(figsize=(width, height))
-    image = axis.imshow(matrix, aspect="auto", interpolation="nearest", vmin=0, vmax=1, cmap="viridis")
-    axis.set_yticks(np.arange(model.config.n_layers))
-    axis.set_yticklabels([f"Layer {i}" for i in range(model.config.n_layers)])
-    axis.set_xticks(np.arange(len(text)))
-    axis.set_xticklabels([display_character(ch) for ch in text], fontsize=8)
-    axis.set_xlabel("Input character")
-    axis.set_title(f"{args.mode.capitalize()} dynamic-depth gates")
-    fig.colorbar(image, ax=axis, label="Gate value", fraction=0.025, pad=0.02)
-    fig.tight_layout()
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    output_path = save_routing_heatmap(model, stoi, args.text, args.mode, args.output)
     print(f"saved {output_path}")
 
     if args.mode == "hard":
+        text = args.text[-model.config.context_length :]
+        ids = torch.tensor([[stoi[ch] for ch in text]], dtype=torch.long, device=device)
+        matrix = model(ids, routing_mode="greedy").hard_gates[0].transpose(0, 1).float().cpu().numpy()
         labels = " ".join(display_character(ch) for ch in text)
         print("tokens  " + labels)
         for layer_idx, row in enumerate(matrix.astype(int)):

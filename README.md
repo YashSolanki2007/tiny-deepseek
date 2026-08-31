@@ -1,44 +1,68 @@
-# Learned Dynamic Depth on Tiny Shakespeare
+# SkipLayer Reproduction and Dynamic-Routing Extensions
 
-This project implements a small character-level decoder-only Transformer and a
-dynamic-depth variant whose binary per-token, per-layer gates are learned with a
-straight-through estimator (STE). Training is ordinary backpropagation with AdamW;
-there is no reinforcement learning or policy-gradient code.
+The primary baseline is now a method-faithful, small-scale reproduction of
+**Learning to Skip for Language Modeling** (arXiv:2311.15436). GRU routing and
+GRPO remain available as explicitly separate extensions and should not be used
+to judge whether the paper's supervised SkipLayer method was reproduced.
 
-The implementation intentionally uses **Stage A routing**: every Transformer block
-is evaluated during training and inference, and the binary gate chooses whether its
-candidate state is accepted. Reported utilization, skipped blocks, and block FLOPs
-are therefore theoretical. The project does not claim wall-clock sparse acceleration.
+## Paper-first workflow
 
-## Architecture
+Run the end-to-end correctness smoke test:
 
-The dense model is an 8-layer pre-norm GPT-style Transformer by default. The dynamic
-model computes a full block candidate and applies
+```bash
+python run_paper_experiments.py \
+  --preset smoke \
+  --experiments-dir experiments/paper_smoke \
+  --results-dir results/paper_smoke
+```
+
+Run the matched-effective-depth Tiny Shakespeare comparison:
+
+```bash
+python run_paper_experiments.py \
+  --preset core \
+  --seeds 42 43 44
+```
+
+The exact protocol uses the paper's Adafactor learning rate of `0.1`. Because
+that rate is unstable at this much smaller scale, a scale-adapted run must be
+explicitly labeled:
+
+```bash
+python run_paper_experiments.py \
+  --preset core \
+  --paper-learning-rate 0.01
+```
+
+See [PAPER_REPRODUCTION.md](PAPER_REPRODUCTION.md) for the equation-by-equation
+mapping, scale substitutions, sparse greedy execution semantics, and Table-1
+analogue.
+
+A correctness-first PyTorch research codebase for comparing four character-level language models on Tiny Shakespeare:
+
+1. dense decoder-only Transformer;
+2. SkipLayer-style linear router;
+3. depth-aware GRU router;
+4. supervised GRU router followed by router-only GRPO.
+
+The scientific question is whether learned routing improves validation quality at **matched compute**, not simply whether one run has lower loss. Results, timing, routing maps, seed aggregates, and the final report are generated from real run artifacts; missing metrics remain `NaN`.
+
+## Important implementation scope
+
+Sparse models apply each hard gate as:
 
 ```python
 candidate = block(x)
 x = (1 - gate) * x + gate * candidate
 ```
 
-Thus `gate=0` is exactly identity and `gate=1` exactly matches the complete block.
-The GRU router keeps a `[batch, time, router_dim]` state and advances it across
-Transformer depth. The MLP router ablation has no depth memory. Both produce
-deterministic hard gates in the forward pass while gradients flow through sigmoid
-probabilities:
+This makes skip exactly identity and execute exactly the complete residual block. Training is a **Stage-A logical sparsity implementation**: all block candidates are still evaluated to preserve the straight-through gradient. Paper-mode greedy evaluation gathers active queries and FFN inputs while retaining key/value projections for all tokens. Density and estimated block FLOPs remain theoretical; generation latency is measured independently. The project does not claim optimized sparse-kernel wall-clock speedup.
 
-```python
-soft = sigmoid(logit)
-hard = (soft >= 0.5).float()
-gate = soft + (hard - soft).detach()
-```
-
-The gate output bias starts at 2.2, so the initial soft probability is about 0.9.
-Because thresholding is deterministic rather than Bernoulli sampling, this means
-essentially all hard gates begin open; 0.9 is the differentiable expected utilization.
+The linear and GRU policies both emit `[skip, execute]` logits. Supervised training uses hard-forward, soft-backward Gumbel-Softmax. The GRU maintains one `[B, T, router_dim]` state per token and propagates it across model depth, never across text positions.
 
 ## Setup
 
-Python 3.10+ is recommended.
+Python 3.10 or newer is recommended.
 
 ```bash
 python -m venv .venv
@@ -46,155 +70,238 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-The first training or validation command downloads Tiny Shakespeare to
-`data/input.txt`, builds the sorted character vocabulary, and uses a deterministic
-90/10 contiguous split.
+`data/input.txt` is downloaded from the Tiny Shakespeare source if absent. Tokenization is character-level with a sorted `stoi`/`itos` vocabulary and a contiguous 90/10 train/validation split. Device selection is CUDA, then Apple MPS, then CPU; override it with `--device`.
 
-## Train
+## Core models
 
 Dense baseline:
 
 ```bash
 python train.py \
   --model dense \
-  --output-dir runs/dense
+  --experiment-dir experiments/dense_seed42
 ```
 
-GRU dynamic-depth model with the default linear compute penalty:
+Linear SkipLayer at 50% target density:
 
 ```bash
 python train.py \
-  --model dynamic \
+  --model sparse \
+  --router linear \
+  --target-density 0.5 \
+  --lambda-density 0.1 \
+  --experiment-dir experiments/linear_P050_lam0.1_seed42
+```
+
+GRU SkipLayer at the same target:
+
+```bash
+python train.py \
+  --model sparse \
   --router gru \
-  --lambda-compute 0.01 \
-  --compute-loss linear \
-  --output-dir runs/dynamic_gru_lambda_0.01
+  --router-dim 32 \
+  --target-density 0.5 \
+  --lambda-density 0.1 \
+  --experiment-dir experiments/gru_P050_lam0.1_seed42
 ```
 
-MLP router ablation:
+Defaults are context 128, width 256, 4 heads, 8 layers, FFN width 1024, dropout 0.1, batch size 32, and 5,000 optimization steps. All three models share the backbone configuration. Input/output embeddings are tied unless `--no-tie-weights` is supplied.
 
-```bash
-python train.py \
-  --model dynamic \
-  --router mlp \
-  --lambda-compute 0.01 \
-  --output-dir runs/dynamic_mlp_lambda_0.01
+The supervised objective is:
+
+```text
+CE + lambda_density × mean_layer((hard_density_layer - target_density)²)
 ```
 
-Target-compute objective (50% expected utilization):
+The density coefficient is zero during the first 10% of training, ramps from 10–30%, and stays at its configured value afterward. Change the schedule with `--density-warmup-start` and `--density-warmup-end`.
+
+## GRPO router fine-tuning
+
+For the paper-faithful linear SkipLayer checkpoint, use the budget-guided,
+per-decision variant. It samples explicit 3/4/5/8-layer rollout groups from a
+recorded router/controller mixture, uses 8/8 as a quality anchor, freezes the
+Transformer, and excludes that deterministic anchor from the policy loss:
 
 ```bash
-python train.py \
-  --model dynamic \
-  --compute-loss target \
-  --target-compute 0.50 \
-  --lambda-compute 0.01 \
-  --output-dir runs/dynamic_target_0.50
+python run_paper_grpo_experiments.py \
+  --checkpoint experiments/paper_core_scaled_lr001_1000/paper_skip_L08_P050_Eff04_seed42/checkpoints/best_val_loss.pt \
+  --lambdas 0.1 1.0 2.0 \
+  --depth-budgets 3 4 5 8 \
+  --exploration-epsilon 0.8
 ```
 
-Defaults match the requested research configuration: context 128, width 256,
-4 heads, 8 layers, FFN width 1024, dropout 0.1, router width 32, AdamW at 3e-4,
-and 5,000 steps. `--device auto` selects CUDA, then Apple MPS, then CPU. Use
-`python train.py --help` for all model, optimizer, schedule, and evaluation options.
+The budget-guided objective uses the exact behavior log probability for every
+sampled token-layer action and applies PPO clipping per decision. CSV and
+TensorBoard logs include achieved depth, CE, reward, and estimated FLOPs for
+each requested budget. `train_grpo.py` below remains the older GRU-router
+extension and is not used for the paper-faithful experiment.
 
-The compute coefficient is zero for the first 10% of steps, ramps linearly from
-10%-30%, and remains at its target afterward. Logs include CE, total loss, compute
-loss, soft/hard utilization, effective depth, skipped fraction, and every layer's
-utilization. Each run saves `checkpoint.pt` and `summary.json`.
-
-## Validate and generate
+Start GRPO from the best supervised GRU validation-loss checkpoint:
 
 ```bash
-python validate.py \
-  --checkpoint runs/dynamic_gru_lambda_0.01/checkpoint.pt \
-  --eval-iters 100
+python train_grpo.py \
+  --checkpoint experiments/gru_P050_lam0.1_seed42/checkpoints/best_val_loss.pt \
+  --experiment-dir experiments/gru_grpo_P050_lam0.1_rl0.1_seed42 \
+  --group-size 4 \
+  --lambda-compute-grpo 0.1 \
+  --beta-kl 0.01 \
+  --grpo-router-only
+```
 
+For each source sequence, GRPO samples a group of routing trajectories. Its default reward is:
+
+```text
+-sequence_CE - lambda_compute_grpo × compute_fraction
+```
+
+The KL to the original supervised router is added to the clipped policy objective by default. `--kl-in-reward` additionally puts it in the sampled reward. Advantages are normalized within each group. A trajectory log probability is the **mean** log probability over all token-layer decisions, avoiding scale growth with context length or depth.
+
+The default freezes embeddings, attention, FFNs, layer norms, and the LM head. `--grpo-unfreeze-transformer` is the optional ablation; it assigns Transformer parameters one tenth the router learning rate.
+
+## Automated experiments
+
+The core four-way comparison is one command:
+
+```bash
+python run_experiments.py --preset core
+```
+
+For three seeds:
+
+```bash
+python run_experiments.py \
+  --preset core \
+  --seeds 42 43 44
+```
+
+The full supervised density/coefficient sweep plus GRPO compute sweep is:
+
+```bash
+python run_experiments.py \
+  --preset full \
+  --seeds 42 43 44
+```
+
+`full` uses density targets 0.75, 0.50, 0.25; supervised coefficients 0.03, 0.1, 0.3; and GRPO compute coefficients 0.01, 0.05, 0.1, 0.2. Override these with `--densities`, `--lambda-densities`, or `--grpo-lambdas`. Completed `summary.json` runs are skipped unless `--force` is supplied. Unrecognized runner options are forwarded to supervised `train.py`, which is useful for smaller integration experiments.
+
+The default core preset is still a substantial training job. For a quick pipeline check:
+
+```bash
+python run_experiments.py \
+  --preset core \
+  --max-steps 2 \
+  --grpo-max-steps 2 \
+  --context-length 8 \
+  --d-model 16 \
+  --n-heads 4 \
+  --n-layers 3 \
+  --d-ff 32 \
+  --batch-size 2 \
+  --eval-interval 1 \
+  --eval-iters 1 \
+  --log-interval 1 \
+  --warmup-steps 0 \
+  --device cpu
+```
+
+## Evaluation, generation, and routing maps
+
+Evaluate one checkpoint:
+
+```bash
+python evaluate.py \
+  --checkpoint experiments/gru_P050_lam0.1_seed42/checkpoints/best_val_loss.pt
+```
+
+Evaluate every completed experiment, including deterministic greedy routing, generation latency, routing maps, and token-difficulty analysis:
+
+```bash
+python evaluate.py --all
+```
+
+Generate text:
+
+```bash
 python generate.py \
-  --checkpoint runs/dynamic_gru_lambda_0.01/checkpoint.pt \
+  --checkpoint experiments/gru_P050_lam0.1_seed42/checkpoints/best_val_loss.pt \
   --prompt "ROMEO:" \
   --max-new-tokens 500 \
   --temperature 0.8 \
   --top-k 40
 ```
 
-Generation reports actual tokens/second plus average layers per generated token,
-the theoretical skip fraction, and per-layer utilization. `--temperature 0` uses
-greedy decoding; `--top-k 0` disables top-k filtering.
-
-## Routing visualization
+Create a routing heatmap manually:
 
 ```bash
 python visualize_routing.py \
-  --checkpoint runs/dynamic_gru_lambda_0.01/checkpoint.pt \
+  --checkpoint experiments/gru_P050_lam0.1_seed42/checkpoints/best_val_loss.pt \
   --text $'ROMEO:\nWhat light through yonder window breaks?' \
-  --mode soft \
-  --output runs/dynamic_gru_lambda_0.01/routing_soft.png
-
-python visualize_routing.py \
-  --checkpoint runs/dynamic_gru_lambda_0.01/checkpoint.pt \
   --mode hard \
-  --output runs/dynamic_gru_lambda_0.01/routing_hard.png
+  --output experiments/gru_P050_lam0.1_seed42/routing_visualizations/custom_hard.png
 ```
 
-Hard mode also prints an ASCII token/layer gate matrix.
+## Results and reports
 
-## Full lambda sweep, CSV, and Pareto curve
-
-The sweep runs one dense model and dynamic models at
-`0, 0.001, 0.005, 0.01, 0.02, 0.05`, then aggregates only real run summaries:
+Regenerate all aggregate outputs from completed experiment summaries:
 
 ```bash
-python run_experiments.py \
-  --runs-dir runs/gru_sweep \
-  --router gru \
-  --max-steps 5000
+python generate_report.py
 ```
 
-Unknown arguments are forwarded to `train.py`, so a quick integration sweep is:
+This creates:
+
+```text
+results/summary.csv
+results/aggregate_results.csv
+results/REPORT.md
+results/REPORT.html
+results/*.png
+results/*.pdf
+```
+
+`REPORT.html` embeds available PNGs as base64 data URIs and works offline. It explicitly distinguishes theoretical density from latency and only evaluates GRPO when paired before/after metrics exist.
+
+Each experiment directory contains:
+
+```text
+config.json
+training_metrics.csv
+tensorboard/
+checkpoints/latest.pt
+checkpoints/best_val_loss.pt
+checkpoints/best_val_perplexity.pt
+checkpoints/best_quality_compute.pt
+plots/
+samples/
+routing_visualizations/
+summary.json
+```
+
+Inspect live metrics with:
 
 ```bash
-python run_experiments.py \
-  --runs-dir runs/smoke_sweep \
-  --max-steps 20 \
-  --eval-interval 20 \
-  --eval-iters 2 \
-  --batch-size 4 \
-  --context-length 32 \
-  --d-model 64 \
-  --d-ff 128 \
-  --n-layers 4
+tensorboard --logdir experiments
 ```
 
-Outputs are `results.csv` and `pareto.png` inside the sweep directory. To aggregate
-selected runs later:
+## Resume
+
+Supervised:
 
 ```bash
-python aggregate_results.py \
-  --runs-dir runs \
-  --csv results.csv \
-  --plot pareto.png
+python train.py \
+  --resume experiments/gru_P050_lam0.1_seed42/checkpoints/latest.pt \
+  --experiment-dir experiments/gru_P050_lam0.1_seed42
 ```
 
-The aggregator exits if there are no summaries; it never invents result rows.
-
-## Speed comparison
-
-Compare actual Stage A generation throughput and theoretical routing side by side:
+GRPO:
 
 ```bash
-python benchmark.py \
-  --checkpoints \
-    runs/dense/checkpoint.pt \
-    runs/dynamic_gru_lambda_0.01/checkpoint.pt \
-  --tokens 100 \
-  --output benchmark.csv
+python train_grpo.py \
+  --resume experiments/gru_grpo_P050_lam0.1_rl0.1_seed42/checkpoints/latest.pt \
+  --experiment-dir experiments/gru_grpo_P050_lam0.1_rl0.1_seed42
 ```
 
-The benchmark performs five unreported warmup tokens by default before timing.
-
-Dynamic Stage A may be slower than dense because it still evaluates all blocks and
-adds router work. Genuine per-token sparse self-attention execution is deliberately
-out of scope for this correctness-first prototype.
+Checkpoints include model, optimizer, scheduler, step, seed/configuration, RNG state, best metrics, vocabulary, and—during GRPO—the frozen supervised reference router. Resume occurs at evaluation/checkpoint boundaries. First-generation one-logit checkpoints under the older `runs/` layout remain untouched but are intentionally rejected by this two-logit architecture with a clear compatibility error.
 
 ## Tests
 
@@ -202,7 +309,23 @@ out of scope for this correctness-first prototype.
 pytest -q
 ```
 
-Tests cover exact identity/full-block gate semantics, binary gate shape, both router
-types, nonzero STE router gradients, initial ~0.9 soft probability, zero compute
-gradient at lambda zero, compute warmup, and utilization pressure from a large
-linear penalty.
+Tests cover exact skip/execute semantics, dense and sparse output shapes, hard binary gates, initial execute probability, linear and GRU router gradients, GRU depth-state propagation, target-density loss, schedule warmup, routing-trajectory diversity, GRPO reward/advantages/clipping, and numerically exact greedy checkpoint restoration.
+
+## File map
+
+- `model.py`, `router.py`: backbone, exact gating, linear and GRU policies.
+- `losses.py`: supervised density and GRPO objectives.
+- `train.py`, `train_grpo.py`, `train_paper_grpo.py`: supervised, legacy GRU-GRPO, and budget-guided paper-router stages.
+- `evaluation.py`, `evaluate.py`, `analysis.py`: metrics and difficulty analysis.
+- `plots.py`, `report.py`, `generate_report.py`: plots and offline reports.
+- `run_experiments.py`, `run_paper_grpo_experiments.py`, `aggregate_results.py`: orchestration and tables.
+- `utils.py`, `logging_utils.py`: device, reproducibility, timing, checkpoints, CSV, TensorBoard.
+
+## Experimental integrity
+
+- Validation data is never used for optimization.
+- Backbone size stays fixed across router comparisons unless the experiment name/config says otherwise.
+- Dense and sparse timing is measured, while theoretical FLOP savings are labeled separately.
+- A lower validation loss at higher compute is not called an improvement.
+- Two or three seeds are summarized but not presented as proof of statistical significance.
+- If GRPO makes routing worse, the generated report says so.

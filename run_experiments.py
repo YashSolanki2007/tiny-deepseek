@@ -1,4 +1,4 @@
-"""Run the dense baseline and the requested dynamic-depth lambda sweep."""
+"""Run reproducible core or full multi-seed sparse-depth experiments."""
 
 from __future__ import annotations
 
@@ -8,56 +8,95 @@ import sys
 from pathlib import Path
 
 
+def run(command: list[str]) -> None:
+    print("running:", " ".join(command), flush=True)
+    subprocess.run(command, check=True)
+
+
+def completed(path: Path, force: bool) -> bool:
+    if not force and (path / "summary.json").exists():
+        print(f"skipping completed experiment: {path}", flush=True)
+        return True
+    return False
+
+
+def resume_arguments(path: Path, force: bool) -> list[str]:
+    latest = path / "checkpoints" / "latest.pt"
+    if latest.exists() and not force:
+        print(f"resuming incomplete experiment: {path}", flush=True)
+        return ["--resume", str(latest)]
+    return []
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--runs-dir", default="runs/sweep")
-    parser.add_argument("--router", choices=["gru", "mlp"], default="gru")
-    parser.add_argument("--lambdas", type=float, nargs="+", default=[0, 0.001, 0.005, 0.01, 0.02, 0.05])
-    parser.add_argument("--skip-dense", action="store_true")
-    args, train_args = parser.parse_known_args()
+    parser.add_argument("--preset", choices=["core", "full", "supervised"], default="core")
+    parser.add_argument("--experiments-dir", default="experiments")
+    parser.add_argument("--results-dir", default="results")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42])
+    parser.add_argument("--densities", type=float, nargs="+", default=None)
+    parser.add_argument("--lambda-densities", type=float, nargs="+", default=None)
+    parser.add_argument("--grpo-lambdas", type=float, nargs="+", default=None)
+    parser.add_argument("--max-steps", type=int, default=5000)
+    parser.add_argument("--grpo-max-steps", type=int, default=1000)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--force", action="store_true")
+    args, extra_train_args = parser.parse_known_args()
+    root = Path(__file__).parent
+    experiments = Path(args.experiments_dir)
+    densities = args.densities or ([0.75, 0.5, 0.25] if args.preset == "full" else [0.5])
+    lambda_densities = args.lambda_densities or ([0.03, 0.1, 0.3] if args.preset == "full" else [0.1])
+    grpo_lambdas = args.grpo_lambdas or ([0.01, 0.05, 0.1, 0.2] if args.preset == "full" else [0.1])
 
-    script = str(Path(__file__).with_name("train.py"))
-    runs_dir = Path(args.runs_dir)
-    commands = []
-    if not args.skip_dense:
-        commands.append(
-            [sys.executable, script, "--model", "dense", "--output-dir", str(runs_dir / "dense")]
-        )
-    for value in args.lambdas:
-        name = f"dynamic_{args.router}_lambda_{value:g}"
-        commands.append(
-            [
-                sys.executable,
-                script,
-                "--model",
-                "dynamic",
-                "--router",
-                args.router,
-                "--lambda-compute",
-                str(value),
-                "--output-dir",
-                str(runs_dir / name),
-            ]
-        )
-    for command in commands:
-        full_command = command + train_args
-        print("running:", " ".join(full_command), flush=True)
-        subprocess.run(full_command, check=True)
+    for seed in args.seeds:
+        dense_dir = experiments / f"dense_seed{seed}"
+        if not completed(dense_dir, args.force):
+            resume = resume_arguments(dense_dir, args.force)
+            run([
+                sys.executable, str(root / "train.py"), "--model", "dense",
+                "--seed", str(seed), "--max-steps", str(args.max_steps),
+                "--device", args.device, "--experiment-dir", str(dense_dir),
+                *resume, *extra_train_args,
+            ])
+        for density in densities:
+            density_label = f"P{int(round(100 * density)):03d}"
+            for lambda_density in lambda_densities:
+                lambda_label = f"lam{lambda_density:g}"
+                for router in ("linear", "gru"):
+                    experiment = experiments / f"{router}_{density_label}_{lambda_label}_seed{seed}"
+                    if not completed(experiment, args.force):
+                        resume = resume_arguments(experiment, args.force)
+                        run([
+                            sys.executable, str(root / "train.py"), "--model", "sparse",
+                            "--router", router, "--target-density", str(density),
+                            "--lambda-density", str(lambda_density), "--seed", str(seed),
+                            "--max-steps", str(args.max_steps), "--device", args.device,
+                            "--experiment-dir", str(experiment), *resume, *extra_train_args,
+                        ])
+                if args.preset == "supervised":
+                    continue
+                supervised = experiments / f"gru_{density_label}_{lambda_label}_seed{seed}"
+                checkpoint = supervised / "checkpoints" / "best_val_loss.pt"
+                for grpo_lambda in grpo_lambdas:
+                    grpo_dir = experiments / f"gru_grpo_{density_label}_{lambda_label}_rl{grpo_lambda:g}_seed{seed}"
+                    if completed(grpo_dir, args.force):
+                        continue
+                    resume = resume_arguments(grpo_dir, args.force)
+                    run([
+                        sys.executable, str(root / "train_grpo.py"), "--checkpoint", str(checkpoint),
+                        "--lambda-compute-grpo", str(grpo_lambda), "--seed", str(seed),
+                        "--max-steps", str(args.grpo_max_steps), "--device", args.device,
+                        "--experiment-dir", str(grpo_dir), "--grpo-router-only", *resume,
+                    ])
 
-    aggregate = str(Path(__file__).with_name("aggregate_results.py"))
-    subprocess.run(
-        [
-            sys.executable,
-            aggregate,
-            "--runs-dir",
-            str(runs_dir),
-            "--csv",
-            str(runs_dir / "results.csv"),
-            "--plot",
-            str(runs_dir / "pareto.png"),
-        ],
-        check=True,
-    )
+    run([
+        sys.executable, str(root / "evaluate.py"), "--all",
+        "--experiments-dir", str(experiments), "--device", args.device,
+    ])
+    run([
+        sys.executable, str(root / "generate_report.py"),
+        "--experiments-dir", str(experiments), "--results-dir", args.results_dir,
+    ])
 
 
 if __name__ == "__main__":
