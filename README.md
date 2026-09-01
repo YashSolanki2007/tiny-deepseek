@@ -1,9 +1,79 @@
-# SkipLayer Reproduction and Dynamic-Routing Extensions
+# MoR with Layer Skipping and GRPO
 
-The primary baseline is now a method-faithful, small-scale reproduction of
-**Learning to Skip for Language Modeling** (arXiv:2311.15436). GRU routing and
-GRPO remain available as explicitly separate extensions and should not be used
-to judge whether the paper's supervised SkipLayer method was reproduced.
+This repository is a correctness-first, small-scale study of dynamic token
+depth on Tiny Shakespeare. It contains:
+
+1. a dense eight-layer decoder-only Transformer;
+2. a supervised reproduction of **Learning to Skip for Language Modeling**
+   (SkipLayer, arXiv:2311.15436);
+3. router-only, budget-guided GRPO fine-tuning for SkipLayer;
+4. a small-scale implementation of **Mixture-of-Recursions** (MoR,
+   arXiv:2507.10524); and
+5. router-only GRPO fine-tuning of MoR's native recursive token routing.
+
+The scientific question is whether routing improves validation quality at
+matched theoretical compute, rather than whether one model has lower loss
+while using more Transformer blocks.
+
+## Exact implementation status
+
+The completed fifth experiment is **MoR + recursion-routing GRPO**. GRPO
+fine-tunes the MoR routers that decide whether each token continues through
+one, two, or three recursions. Because MoR already skips later recursive work
+for filtered tokens, this is a GRPO-controlled form of token skipping.
+
+It is **not yet** the literal two-level hybrid `MoR + SkipLayer + GRPO`. In that
+unimplemented hybrid, MoR would first select the tokens admitted to a recursion
+and an additional independent `[skip, execute]` SkipLayer gate would then act
+inside every shared block application. The current code does not contain that
+second gate, and the results below must not be presented as evidence for it.
+
+| System | Implemented | Meaning |
+|---|---:|---|
+| Full dense | Yes | All eight blocks execute for every token |
+| SkipLayer | Yes | Per-token, per-layer supervised skip/execute gates |
+| SkipLayer + GRPO | Yes | GRPO fine-tunes the SkipLayer router |
+| MoR | Yes | Paper-style hierarchical recursive token filtering |
+| MoR + recursion-routing GRPO | Yes | GRPO fine-tunes native MoR continuation decisions |
+| MoR + independent SkipLayer + GRPO | No | Separate SkipLayer gates inside MoR recursions |
+
+## Completed five-way result
+
+The matched run used a character-level Tiny Shakespeare split, seed `42`,
+context length `128`, width `128`, two attention heads, FFN width `1024`, eight
+effective layers, batch size `32`, and `1,000` supervised steps. Both GRPO
+stages ran for `300` router-only steps with compute coefficient `1.0`, behavior
+mixture epsilon `0.8`, PPO clip epsilon `0.5`, and a frozen Transformer
+backbone. Final metrics were measured over 20 validation batches.
+
+| Model | Validation CE ↓ | Perplexity ↓ | Next-character accuracy ↑ | Layers/token ↓ | Block FLOPs vs dense ↓ | FLOP reduction | Unique parameters |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Full dense | 2.1560 | 8.637 | 36.15% | 8.000 | 1.000× | 0.00% | 2.664M |
+| SkipLayer | **2.1389** | **8.490** | **37.21%** | 4.463 | 0.599× | 40.13% | 2.666M |
+| SkipLayer + GRPO | 2.1452 | 8.544 | 37.06% | **4.385** | **0.590×** | **41.01%** | 2.666M |
+| MoR | 2.1704 | 8.761 | 35.50% | 5.489 | 0.681× | 31.87% | **1.345M** |
+| MoR + recursion-routing GRPO | 2.1720 | 8.776 | 35.56% | 5.196 | 0.644× | 35.59% | **1.345M** |
+
+The main observations are:
+
+- Supervised SkipLayer was the best measured quality/compute point. It improved
+  accuracy by `1.06` percentage points over dense while reducing estimated
+  block FLOPs by `40.13%`.
+- SkipLayer + GRPO produced the lowest estimated FLOPs, but the extra reduction
+  over supervised SkipLayer was only `0.89` percentage points and validation CE
+  worsened by `0.0063`.
+- MoR reduced unique parameters by approximately `49.5%`. Supervised MoR used
+  `31.87%` fewer estimated block FLOPs than dense with a `0.0144` CE increase.
+- MoR recursion-routing GRPO reduced MoR compute from `0.681×` to `0.644×`
+  dense. Next-character accuracy was effectively unchanged, while CE worsened
+  by `0.0017`.
+- These are one-seed, character-model results. They are not evidence that the
+  same ranking or savings will transfer directly to LLM scale.
+
+The complete generated report and raw table are available at
+[results/mor_comparison_seed42/REPORT.md](results/mor_comparison_seed42/REPORT.md)
+and
+[results/mor_comparison_seed42/summary.csv](results/mor_comparison_seed42/summary.csv).
 
 ## Paper-first workflow
 
@@ -38,14 +108,8 @@ See [PAPER_REPRODUCTION.md](PAPER_REPRODUCTION.md) for the equation-by-equation
 mapping, scale substitutions, sparse greedy execution semantics, and Table-1
 analogue.
 
-A correctness-first PyTorch research codebase for comparing four character-level language models on Tiny Shakespeare:
-
-1. dense decoder-only Transformer;
-2. SkipLayer-style linear router;
-3. depth-aware GRU router;
-4. supervised GRU router followed by router-only GRPO.
-
-The scientific question is whether learned routing improves validation quality at **matched compute**, not simply whether one run has lower loss. Results, timing, routing maps, seed aggregates, and the final report are generated from real run artifacts; missing metrics remain `NaN`.
+The earlier GRU router experiments remain available as extensions, but are not
+part of the completed five-way MoR comparison above.
 
 ## Important implementation scope
 
@@ -115,8 +179,6 @@ CE + lambda_density × mean_layer((hard_density_layer - target_density)²)
 
 The density coefficient is zero during the first 10% of training, ramps from 10–30%, and stays at its configured value afterward. Change the schedule with `--density-warmup-start` and `--density-warmup-end`.
 
-## GRPO router fine-tuning
-
 ## Mixture-of-Recursions comparison
 
 The paper-aligned MoR implementation uses Middle-Cycle parameter sharing:
@@ -126,8 +188,8 @@ stored Transformer blocks. Hierarchical expert-choice capacities are
 `1, 2/3, 1/3`; validation logs learned greedy routing separately from oracle
 top-k routing.
 
-Run the complete requested comparison—full dense, SkipLayer, SkipLayer + GRPO,
-MoR, and MoR + GRPO—with:
+Run the complete comparison—full dense, SkipLayer, SkipLayer + GRPO, MoR, and
+MoR + recursion-routing GRPO—with:
 
 ```bash
 python run_mor_comparison.py
@@ -152,6 +214,8 @@ Open `http://localhost:6006`. Supervised runs log `train`, `validation`, and,
 for MoR, `validation_oracle_topk`. GRPO runs additionally log reward, policy
 ratio/clipping, KL, entropy, achieved depth and FLOPs for every rollout budget,
 plus per-recursion utilization and router diagnostics.
+
+## GRPO router fine-tuning
 
 For the paper-faithful linear SkipLayer checkpoint, use the budget-guided,
 per-decision variant. It samples explicit 3/4/5/8-layer rollout groups from a
