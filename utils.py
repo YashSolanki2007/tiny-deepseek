@@ -84,6 +84,19 @@ def routing_metrics(output: ModelOutput, n_layers: int) -> Dict[str, Any]:
             output.mor_router_accuracy.detach().item()
         )
         metrics["mor_aux_loss"] = float(output.mor_aux_loss.detach().item())
+    if output.skip_conditional_utilization is not None:
+        metrics["skip_conditional_utilization"] = (
+            output.skip_conditional_utilization.detach().float().cpu().tolist()
+        )
+        metrics["skip_soft_conditional_utilization"] = (
+            output.skip_soft_conditional_utilization.detach().float().cpu().tolist()
+        )
+        metrics["combined_block_utilization"] = (
+            output.combined_block_utilization.detach().float().cpu().tolist()
+        )
+        metrics["mean_conditional_skip_density"] = float(
+            output.skip_conditional_utilization.detach().float().mean().item()
+        )
     return metrics
 
 
@@ -153,6 +166,48 @@ def estimate_mor_flops(
         )
         # One scalar linear router is evaluated for each candidate token.
         total += 2 * previous * length * d
+        previous = p
+    return float(total)
+
+
+def estimate_mor_skip_flops(
+    config: ModelConfig,
+    seq_len: int,
+    recursion_utilization: Iterable[float],
+    combined_block_utilization: Iterable[float],
+) -> float:
+    """FLOPs for MoR admission followed by inner SkipLayer execution.
+
+    For an admitted recursion, K/V projections retain every admitted token as
+    context, matching SkipLayer semantics. Query/output projections, attention
+    queries, and FFNs are evaluated only for tokens whose inner gate executes.
+    """
+    recursion = [float(value) for value in recursion_utilization]
+    combined = [float(value) for value in combined_block_utilization]
+    expected_inner = config.recursion_steps * config.recursion_block_layers
+    if len(recursion) != config.recursion_steps:
+        raise ValueError("recursion utilization length must match recursion_steps")
+    if len(combined) != expected_inner:
+        raise ValueError("combined utilization must match recursive block applications")
+    d, ff, length = config.d_model, config.d_ff, float(seq_len)
+    full_layer = 8 * length * d * d + 4 * length * length * d + 4 * length * d * ff
+    total = 2 * full_layer
+    previous = 1.0
+    inner_index = 0
+    for admitted in recursion:
+        p = min(max(admitted, 0.0), previous)
+        total += 2 * previous * length * d  # scalar MoR admission router
+        for _ in range(config.recursion_block_layers):
+            executed = min(max(combined[inner_index], 0.0), p)
+            key_value = 4 * p * length * d * d
+            active_query_output = 4 * executed * length * d * d
+            attention = 4 * executed * p * length * length * d
+            feed_forward = 4 * executed * length * d * ff
+            skip_router = 4 * p * length * d
+            total += (
+                key_value + active_query_output + attention + feed_forward + skip_router
+            )
+            inner_index += 1
         previous = p
     return float(total)
 

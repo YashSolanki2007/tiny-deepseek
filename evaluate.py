@@ -20,6 +20,7 @@ from generate import generate_tokens
 from utils import (
     estimate_dense_block_flops,
     estimate_mor_flops,
+    estimate_mor_skip_flops,
     estimate_skiplayer_flops,
     load_checkpoint,
     select_device,
@@ -56,6 +57,13 @@ def evaluate_checkpoint(
                 model.config.context_length,
                 metrics["recursion_utilization"],
             )
+        elif model.config.model_type == "mor_skip":
+            estimated_flops = estimate_mor_skip_flops(
+                model.config,
+                model.config.context_length,
+                metrics["recursion_utilization"],
+                metrics["combined_block_utilization"],
+            )
         else:
             estimated_flops = estimate_skiplayer_flops(
                 model.config,
@@ -84,7 +92,7 @@ def evaluate_checkpoint(
     (samples_dir / "evaluation_sample.txt").write_text(sample + "\n", encoding="utf-8")
     plots = experiment_dir / "plots"
     save_difficulty_plot(difficulty, plots / "difficulty_vs_depth")
-    if model.config.model_type in {"sparse", "mor"}:
+    if model.config.model_type in {"sparse", "mor", "mor_skip"}:
         routing_dir = experiment_dir / "routing_visualizations"
         text = "ROMEO:\nWhat light through yonder window breaks?"
         save_routing_heatmap(model, dataset.stoi, text, "soft", routing_dir / "routing_soft.png")
@@ -111,7 +119,7 @@ def evaluate_checkpoint(
             + router_parameters
             + metrics["compute_fraction"] * block_parameters
         )
-    elif model.config.model_type == "mor":
+    elif model.config.model_type in {"mor", "mor_skip"}:
         summary["active_parameter_estimate"] = model.parameter_count()
     summary["checkpoint"] = str(checkpoint_path)
     write_json(summary_path, summary)

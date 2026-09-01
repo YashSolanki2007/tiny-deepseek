@@ -29,6 +29,9 @@ COLUMNS = [
     "recursion_utilization", "recursion_soft_utilization",
     "mean_recursions_per_token", "mor_router_accuracy", "mor_aux_loss",
     "estimated_flops_vs_full_dense",
+    "skip_density_budgets", "mean_conditional_skip_density",
+    "skip_conditional_utilization", "skip_soft_conditional_utilization",
+    "combined_block_utilization", "source_mor_checkpoint",
 ]
 GROUP_KEYS = ["model", "router_type", "training_method", "target_density", "lambda_density", "lambda_grpo"]
 METRICS = [

@@ -41,14 +41,14 @@ class ModelConfig:
             self.router_type = "linear"
         if self.d_model % self.n_heads:
             raise ValueError("d_model must be divisible by n_heads")
-        if self.model_type not in {"dense", "sparse", "mor"}:
-            raise ValueError("model_type must be dense, sparse, or mor")
+        if self.model_type not in {"dense", "sparse", "mor", "mor_skip"}:
+            raise ValueError("model_type must be dense, sparse, mor, or mor_skip")
         if self.router_type not in {"linear", "gru"}:
             raise ValueError("router_type must be linear or gru")
         if not 0 < self.initial_execute_probability < 1:
             raise ValueError("initial_execute_probability must be in (0, 1)")
         self.mor_capacity_factors = tuple(float(value) for value in self.mor_capacity_factors)
-        if self.model_type == "mor":
+        if self.model_type in {"mor", "mor_skip"}:
             expected_layers = 2 + self.recursion_steps * self.recursion_block_layers
             if self.n_layers != expected_layers:
                 raise ValueError(

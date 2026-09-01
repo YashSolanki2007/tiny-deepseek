@@ -8,3 +8,13 @@ checkpoints/
 *.png
 results.csv
 benchmark.csv
+
+# Generated artifacts
+experiments/
+results/
+tmp/
+*.html
+*.pdf
+*.csv
+*.json
+.DS_Store

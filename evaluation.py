@@ -41,10 +41,16 @@ def evaluate_model(
     soft_layers = torch.zeros(model.config.n_layers)
     recursion_layers = (
         torch.zeros(model.config.recursion_steps)
-        if model.config.model_type == "mor" else None
+        if model.config.model_type in {"mor", "mor_skip"} else None
     )
     recursion_soft = torch.zeros_like(recursion_layers) if recursion_layers is not None else None
     mor_aux_loss = mor_router_accuracy = 0.0
+    inner_count = model.config.recursion_steps * model.config.recursion_block_layers
+    skip_conditional = (
+        torch.zeros(inner_count) if model.config.model_type == "mor_skip" else None
+    )
+    skip_soft_conditional = torch.zeros_like(skip_conditional) if skip_conditional is not None else None
+    combined_blocks = torch.zeros_like(skip_conditional) if skip_conditional is not None else None
     generator = torch.Generator().manual_seed(eval_seed)
     synchronize_device(device)
     started = time.perf_counter()
@@ -79,6 +85,12 @@ def evaluate_model(
             recursion_soft += torch.tensor(route["recursion_soft_utilization"])
             mor_aux_loss += route["mor_aux_loss"]
             mor_router_accuracy += route["mor_router_accuracy"]
+        if skip_conditional is not None:
+            skip_conditional += torch.tensor(route["skip_conditional_utilization"])
+            skip_soft_conditional += torch.tensor(
+                route["skip_soft_conditional_utilization"]
+            )
+            combined_blocks += torch.tensor(route["combined_block_utilization"])
     synchronize_device(device)
     elapsed = time.perf_counter() - started
     for key in totals:
@@ -95,6 +107,19 @@ def evaluate_model(
         )
         totals["mor_aux_loss"] = mor_aux_loss / eval_iters
         totals["mor_router_accuracy"] = mor_router_accuracy / eval_iters
+    if skip_conditional is not None:
+        totals["skip_conditional_utilization"] = (
+            skip_conditional / eval_iters
+        ).tolist()
+        totals["skip_soft_conditional_utilization"] = (
+            skip_soft_conditional / eval_iters
+        ).tolist()
+        totals["combined_block_utilization"] = (
+            combined_blocks / eval_iters
+        ).tolist()
+        totals["mean_conditional_skip_density"] = float(
+            (skip_conditional / eval_iters).mean().item()
+        )
     if was_training:
         model.train()
     return totals

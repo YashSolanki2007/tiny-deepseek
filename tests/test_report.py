@@ -51,3 +51,26 @@ def test_mor_runs_generate_five_way_report(tmp_path) -> None:
     assert "Middle-Cycle" in report
     assert "oracle top-k" in report
     assert "MoR + GRPO" in report
+
+
+def test_mor_skip_runs_are_labeled_as_literal_two_level_hybrid(tmp_path) -> None:
+    rows = [
+        {
+            "model": "dense", "router_type": "none", "training_method": "supervised",
+            "seed": 42, "val_loss": 2.0, "val_perplexity": 7.4,
+            "layers_per_token": 8.0, "skip_fraction": 0.0,
+            "parameter_count": 2_000_000,
+            "estimated_executed_block_flops_per_sequence": 200.0,
+        },
+        {
+            "model": "mor_skip", "router_type": "mor_expert_plus_inner_skiplayer",
+            "training_method": "grpo", "seed": 42, "val_loss": 2.05,
+            "val_perplexity": 7.8, "layers_per_token": 4.5, "skip_fraction": 0.4375,
+            "parameter_count": 1_010_000,
+            "estimated_executed_block_flops_per_sequence": 110.0,
+        },
+    ]
+    report = report_markdown(rows, tmp_path)
+    assert "literal two-level MoR + SkipLayer hybrid" in report
+    assert "MoR + SkipLayer + GRPO" in report
+    assert "combined gate is `MoR_admitted × SkipLayer_execute`" in report

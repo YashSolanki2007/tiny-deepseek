@@ -4,7 +4,7 @@ import torch
 
 from config import ModelConfig
 from model import TransformerBlock, apply_block_gate, build_model
-from utils import estimate_dense_block_flops, estimate_mor_flops
+from utils import estimate_dense_block_flops, estimate_mor_flops, estimate_mor_skip_flops
 
 
 def tiny_config(**overrides) -> ModelConfig:
@@ -209,3 +209,95 @@ def test_recursion_wise_attention_saves_more_than_linear_depth_fraction() -> Non
     routed = estimate_mor_flops(config, config.context_length, [1.0, 0.625, 0.25])
     full = estimate_dense_block_flops(config, config.context_length)
     assert routed < full
+
+
+def test_mor_skip_has_independent_inner_actions_and_combined_gates() -> None:
+    config = tiny_config(
+        model_type="mor_skip", router_type="linear", n_layers=8,
+        recursion_steps=3, recursion_block_layers=2,
+        initial_execute_probability=0.9, router_bias=True,
+    )
+    model = build_model(config).eval()
+    output = model(torch.randint(0, 19, (2, 8)), routing_mode="greedy")
+    assert len(model.blocks) == 4
+    assert len(model.skip_router.gate_heads) == 6
+    assert output.hard_gates.shape == (2, 8, 8)
+    assert output.actions.shape == (2, 8, 6)
+    assert output.mor_actions.shape == (2, 8, 3)
+    assert output.route_logits.shape == (2, 8, 6, 2)
+    for inner in range(6):
+        recursion = inner // 2
+        assert torch.equal(
+            output.routing_decision_mask[..., inner],
+            output.mor_actions[..., recursion].bool(),
+        )
+        assert not bool(
+            output.skip_hard_gates[..., inner][
+                ~output.routing_decision_mask[..., inner]
+            ].any()
+        )
+
+
+def test_mor_skip_budget_zero_and_execute_all_eligible_are_exact() -> None:
+    config = tiny_config(
+        model_type="mor_skip", router_type="linear", n_layers=8,
+        recursion_steps=3, recursion_block_layers=2,
+        initial_execute_probability=0.9, router_bias=True,
+    )
+    model = build_model(config).eval()
+    output = model(
+        torch.randint(0, 19, (2, 8)),
+        routing_mode="budget",
+        target_skip_densities=torch.tensor([0.0, 1.0]),
+        exploration_epsilon=torch.ones(2),
+    )
+    assert output.skip_hard_gates[0].sum().item() == 0
+    assert output.hard_gates[0].sum(dim=-1).eq(2).all()
+    torch.testing.assert_close(
+        output.skip_hard_gates[1],
+        output.routing_decision_mask[1].float(),
+    )
+    assert torch.isfinite(
+        output.behavior_log_probs[output.routing_decision_mask]
+    ).all()
+
+
+def test_mor_skip_flops_reduce_to_mor_when_all_inner_gates_execute() -> None:
+    config = tiny_config(
+        model_type="mor_skip", router_type="linear", n_layers=8,
+        recursion_steps=3, recursion_block_layers=2,
+    )
+    recursion = [1.0, 0.625, 0.25]
+    combined = [value for value in recursion for _ in range(2)]
+    hybrid = estimate_mor_skip_flops(
+        config, config.context_length, recursion, combined
+    )
+    mor = estimate_mor_flops(config, config.context_length, recursion)
+    assert mor < hybrid < mor * 1.01
+
+
+def test_mor_skip_execute_all_matches_the_same_mor_backbone() -> None:
+    torch.manual_seed(91)
+    mor_config = tiny_config(
+        model_type="mor", router_type="linear", n_layers=8,
+        recursion_steps=3, recursion_block_layers=2, dropout=0.0,
+    )
+    mor = build_model(mor_config).eval()
+    hybrid_values = mor_config.to_dict()
+    hybrid_values.update(
+        model_type="mor_skip", router_bias=True,
+        initial_execute_probability=0.9,
+    )
+    hybrid = build_model(ModelConfig.from_dict(hybrid_values)).eval()
+    missing, unexpected = hybrid.load_state_dict(mor.state_dict(), strict=False)
+    assert not unexpected
+    assert missing and all(key.startswith("skip_router.") for key in missing)
+    with torch.no_grad():
+        for head in hybrid.skip_router.gate_heads:
+            head.weight.zero_()
+            head.bias.copy_(torch.tensor([-10.0, 10.0]))
+    token_ids = torch.randint(0, mor_config.vocab_size, (2, 8))
+    expected = mor(token_ids, routing_mode="greedy")
+    actual = hybrid(token_ids, routing_mode="greedy")
+    torch.testing.assert_close(actual.logits, expected.logits, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(actual.hard_gates, expected.hard_gates)

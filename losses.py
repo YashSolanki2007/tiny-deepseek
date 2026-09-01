@@ -23,6 +23,27 @@ def density_loss(
     raise ValueError("density reduction must be 'mean' or 'sum'")
 
 
+def masked_density_loss(
+    hard_gates: torch.Tensor,
+    decision_mask: torch.Tensor,
+    target_density: float,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """Per-layer density error over only routing-eligible decisions."""
+    if hard_gates.shape != decision_mask.shape:
+        raise ValueError("hard_gates and decision_mask must have matching shapes")
+    eligible = decision_mask.to(hard_gates.dtype)
+    per_layer_density = (hard_gates * eligible).sum(dim=(0, 1)) / eligible.sum(
+        dim=(0, 1)
+    ).clamp_min(1)
+    per_layer = (per_layer_density - target_density).square()
+    if reduction == "sum":
+        return per_layer.sum()
+    if reduction == "mean":
+        return per_layer.mean()
+    raise ValueError("density reduction must be 'mean' or 'sum'")
+
+
 def scheduled_coefficient(
     step: int, total_steps: int, target: float, start: float = 0.1, end: float = 0.3
 ) -> float:

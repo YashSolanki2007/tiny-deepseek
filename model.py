@@ -31,6 +31,12 @@ class ModelOutput:
     mor_router_accuracy: Optional[torch.Tensor] = None
     recursion_utilization: Optional[torch.Tensor] = None
     recursion_soft_utilization: Optional[torch.Tensor] = None
+    mor_actions: Optional[torch.Tensor] = None
+    skip_hard_gates: Optional[torch.Tensor] = None
+    skip_soft_gates: Optional[torch.Tensor] = None
+    skip_conditional_utilization: Optional[torch.Tensor] = None
+    skip_soft_conditional_utilization: Optional[torch.Tensor] = None
+    combined_block_utilization: Optional[torch.Tensor] = None
 
 
 class CausalSelfAttention(nn.Module):
@@ -561,6 +567,296 @@ class MixtureOfRecursionsTransformer(TransformerBase):
             recursion_utilization=recursion_hard.float().mean(dim=(0, 1)),
             recursion_soft_utilization=recursion_soft.float().mean(dim=(0, 1)),
         )
+
+
+class MixtureOfRecursionsSkipLayerTransformer(MixtureOfRecursionsTransformer):
+    """Paper-style MoR with an independent SkipLayer gate inside each cycle.
+
+    MoR first admits tokens to a recursion. Each admitted token then receives a
+    separate binary skip/execute decision for every shared block application.
+    Entry and exit blocks always execute. The six inner heads in the default
+    2-block/3-recursion setup are distinct even though the block parameters are
+    shared across recursions.
+    """
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__(config)
+        inner_layers = config.recursion_steps * config.recursion_block_layers
+        self.skip_router = LinearDepthRouter(
+            config.d_model,
+            inner_layers,
+            config.initial_execute_probability,
+            bias=config.router_bias,
+        )
+        self.skip_router.apply(self._init_weights)
+        for head in self.skip_router.gate_heads:
+            initialize_gate_head(
+                head,
+                config.initial_execute_probability,
+                weight_std=0.02 if config.paper_reproduction else 1e-3,
+            )
+
+    @property
+    def router(self) -> LinearDepthRouter:
+        """Expose the trainable inner SkipLayer policy as the primary router."""
+        return self.skip_router
+
+    def skip_router_parameters(self):
+        return self.skip_router.parameters()
+
+    def mor_router_parameters(self):
+        return self.recursion_routers.parameters()
+
+    def router_parameters(self):
+        return iter((*self.recursion_routers.parameters(), *self.skip_router.parameters()))
+
+    @staticmethod
+    def _conditional_mean(
+        values: torch.Tensor, candidates: torch.Tensor
+    ) -> torch.Tensor:
+        numerator = (values * candidates.to(values.dtype)).sum(dim=(0, 1))
+        denominator = candidates.sum(dim=(0, 1)).clamp_min(1).to(values.dtype)
+        return numerator / denominator
+
+    def forward(
+        self,
+        token_ids: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        routing_mode: Optional[str] = None,
+        actions: Optional[torch.Tensor] = None,
+        router_override: Optional[nn.Module] = None,
+        target_skip_densities: Optional[torch.Tensor] = None,
+        exploration_epsilon: float | torch.Tensor = 0.0,
+    ) -> ModelOutput:
+        mode = routing_mode or ("topk" if self.training else "greedy")
+        if mode == "gumbel":
+            mode = "topk"
+        if mode not in {"topk", "greedy", "sample", "budget"}:
+            raise ValueError(f"Unknown MoR+Skip routing mode: {mode}")
+
+        skip_router = router_override if router_override is not None else self.skip_router
+        x = self.blocks[0](self.embed(token_ids))
+        batch, seq_len = token_ids.shape
+        inner_count = self.config.recursion_steps * self.config.recursion_block_layers
+        if actions is not None and actions.shape != (batch, seq_len, inner_count):
+            raise ValueError(
+                "MoR+Skip replay actions must have shape "
+                f"[batch, sequence, {inner_count}]"
+            )
+        if mode == "budget":
+            if target_skip_densities is None or target_skip_densities.shape != (batch,):
+                raise ValueError(
+                    "budget MoR+Skip routing requires target_skip_densities shaped [batch]"
+                )
+            target_skip_densities = target_skip_densities.to(
+                device=token_ids.device, dtype=torch.float32
+            )
+            if bool(((target_skip_densities < 0) | (target_skip_densities > 1)).any()):
+                raise ValueError("target_skip_densities must lie in [0,1]")
+            epsilon = torch.as_tensor(
+                exploration_epsilon, device=token_ids.device, dtype=torch.float32
+            )
+            if epsilon.ndim == 0:
+                epsilon = epsilon.expand(batch)
+            if epsilon.shape != (batch,) or bool(((epsilon < 0) | (epsilon > 1)).any()):
+                raise ValueError("exploration_epsilon must be scalar or [batch] in [0,1]")
+
+        previous_selected = torch.ones(
+            batch, seq_len, device=token_ids.device, dtype=torch.bool
+        )
+        recursion_hard, recursion_soft = [], []
+        auxiliary_losses, accuracies = [], []
+        skip_gates = [x.new_zeros((batch, seq_len)) for _ in range(inner_count)]
+        skip_soft = [x.new_zeros((batch, seq_len)) for _ in range(inner_count)]
+        skip_actions = [
+            torch.zeros((batch, seq_len), device=x.device, dtype=torch.long)
+            for _ in range(inner_count)
+        ]
+        skip_log_probs = [x.new_zeros((batch, seq_len)) for _ in range(inner_count)]
+        skip_behavior_log_probs = [
+            x.new_zeros((batch, seq_len)) for _ in range(inner_count)
+        ]
+        skip_entropies = [x.new_zeros((batch, seq_len)) for _ in range(inner_count)]
+        skip_logits = [x.new_zeros((batch, seq_len, 2)) for _ in range(inner_count)]
+        skip_decision_masks = [
+            torch.zeros((batch, seq_len), device=x.device, dtype=torch.bool)
+            for _ in range(inner_count)
+        ]
+
+        for recursion_index in range(self.config.recursion_steps):
+            raw_logits = self.recursion_routers[recursion_index](x).squeeze(-1)
+            policy_execute = raw_logits.sigmoid()
+            candidates = previous_selected
+            if recursion_index == 0:
+                selected = candidates
+            elif mode == "topk":
+                capacity = self._capacity(recursion_index)
+                count = max(1, int(capacity * seq_len))
+                scores = raw_logits.masked_fill(~candidates, float("-inf"))
+                selected = torch.zeros_like(candidates)
+                for batch_index in range(batch):
+                    take = min(count, int(candidates[batch_index].sum().item()))
+                    if take:
+                        indices = scores[batch_index].topk(take, sorted=False).indices
+                        selected[batch_index, indices] = True
+            else:
+                # Hybrid GRPO changes only the inner SkipLayer policy. MoR
+                # admission remains its deterministic deployable policy.
+                selected = policy_execute.ge(0.5) & candidates
+
+            capacity = self._capacity(recursion_index)
+            target_count = max(1, int(capacity * seq_len))
+            oracle_target = torch.zeros_like(candidates)
+            scores = raw_logits.masked_fill(~candidates, float("-inf"))
+            for batch_index in range(batch):
+                take = min(target_count, int(candidates[batch_index].sum().item()))
+                if take:
+                    indices = scores[batch_index].topk(take, sorted=False).indices
+                    oracle_target[batch_index, indices] = True
+            if bool(candidates.any()):
+                auxiliary_losses.append(
+                    F.binary_cross_entropy_with_logits(
+                        raw_logits[candidates], oracle_target[candidates].float()
+                    )
+                )
+                accuracies.append(
+                    policy_execute.ge(0.5)[candidates]
+                    .eq(oracle_target[candidates])
+                    .float()
+                    .mean()
+                )
+            else:
+                auxiliary_losses.append(raw_logits.sum() * 0.0)
+                accuracies.append(raw_logits.new_ones(()))
+
+            output = x.clone()
+            for batch_index in range(batch):
+                indices = selected[batch_index].nonzero(as_tuple=False).flatten()
+                if indices.numel() == 0:
+                    continue
+                initial = x[batch_index : batch_index + 1, indices]
+                transformed = initial
+                for block_index, block in enumerate(self.blocks[1:-1]):
+                    inner_index = (
+                        recursion_index * self.config.recursion_block_layers + block_index
+                    )
+                    router_input = block.ln1(transformed)
+                    local_logits = skip_router.forward_layer(router_input, inner_index)
+                    supplied = (
+                        actions[batch_index : batch_index + 1, indices, inner_index]
+                        if actions is not None else None
+                    )
+                    if mode == "budget" and supplied is None:
+                        scaled = local_logits / self.config.gumbel_temperature
+                        policy_log = F.log_softmax(scaled, dim=-1)
+                        probabilities = policy_log.exp()
+                        controller = target_skip_densities[batch_index]
+                        mixed_execute = (
+                            (1.0 - epsilon[batch_index]) * probabilities[..., 1]
+                            + epsilon[batch_index] * controller
+                        )
+                        behavior_execute = mixed_execute.clamp(
+                            torch.finfo(local_logits.dtype).eps,
+                            1.0 - torch.finfo(local_logits.dtype).eps,
+                        )
+                        if bool(epsilon[batch_index].eq(1.0)):
+                            behavior_execute = torch.full_like(
+                                behavior_execute, controller
+                            )
+                        chosen = torch.rand_like(behavior_execute).lt(
+                            behavior_execute
+                        ).long()
+                        gate = chosen.to(local_logits.dtype)
+                        soft = probabilities[..., 1]
+                        log_probability = torch.where(
+                            chosen.bool(), policy_log[..., 1], policy_log[..., 0]
+                        )
+                        behavior_log_probability = torch.where(
+                            chosen.bool(),
+                            behavior_execute.log(),
+                            (-behavior_execute).log1p(),
+                        )
+                        entropy = -(probabilities * policy_log).sum(dim=-1)
+                    else:
+                        skip_mode = (
+                            "gumbel" if mode == "topk" and self.training
+                            else "sample" if mode == "sample"
+                            else "greedy"
+                        )
+                        gate, soft, chosen, log_probability, entropy = route_from_logits(
+                            local_logits,
+                            skip_mode,
+                            self.config.gumbel_temperature,
+                            supplied,
+                        )
+                        behavior_log_probability = log_probability
+
+                    if self.config.sparse_inference and not self.training and mode == "greedy":
+                        transformed = block.forward_selected(transformed, chosen.bool())
+                    else:
+                        transformed = apply_block_gate(
+                            transformed, block(transformed), gate.unsqueeze(-1)
+                        )
+
+                    for collection, local_value, fill in (
+                        (skip_gates, gate, 0.0),
+                        (skip_soft, soft, 0.0),
+                        (skip_actions, chosen, 0),
+                        (skip_log_probs, log_probability, 0.0),
+                        (skip_behavior_log_probs, behavior_log_probability, 0.0),
+                        (skip_entropies, entropy, 0.0),
+                    ):
+                        collection[inner_index][batch_index, indices] = local_value[0]
+                    skip_logits[inner_index][batch_index, indices] = local_logits[0]
+                    skip_decision_masks[inner_index][batch_index, indices] = True
+
+                weight = (
+                    self.config.mor_router_alpha
+                    * policy_execute[batch_index, indices]
+                ).view(1, -1, 1)
+                output[batch_index, indices] = (
+                    initial + weight * (transformed - initial)
+                )[0]
+            x = output
+            previous_selected = selected
+            recursion_hard.append(selected.float())
+            recursion_soft.append(policy_execute * candidates.float())
+
+        x = self.blocks[-1](x)
+        hard_inner = torch.stack(skip_gates, dim=-1)
+        soft_inner = torch.stack(skip_soft, dim=-1)
+        decision_mask = torch.stack(skip_decision_masks, dim=-1)
+        ones = torch.ones(batch, seq_len, device=x.device, dtype=x.dtype)
+        hard_layers = torch.cat((ones.unsqueeze(-1), hard_inner, ones.unsqueeze(-1)), dim=-1)
+        soft_layers = torch.cat((ones.unsqueeze(-1), soft_inner, ones.unsqueeze(-1)), dim=-1)
+        recursion_hard_tensor = torch.stack(recursion_hard, dim=-1)
+        recursion_soft_tensor = torch.stack(recursion_soft, dim=-1)
+        return self.finish(
+            x,
+            targets,
+            soft_gates=soft_layers,
+            hard_gates=hard_layers,
+            actions=torch.stack(skip_actions, dim=-1),
+            action_log_probs=torch.stack(skip_log_probs, dim=-1),
+            behavior_log_probs=torch.stack(skip_behavior_log_probs, dim=-1),
+            routing_entropy=torch.stack(skip_entropies, dim=-1),
+            route_logits=torch.stack(skip_logits, dim=2),
+            routing_decision_mask=decision_mask,
+            mor_aux_loss=torch.stack(auxiliary_losses).sum(),
+            mor_router_accuracy=torch.stack(accuracies).mean(),
+            recursion_utilization=recursion_hard_tensor.mean(dim=(0, 1)),
+            recursion_soft_utilization=recursion_soft_tensor.mean(dim=(0, 1)),
+            mor_actions=recursion_hard_tensor.long(),
+            skip_hard_gates=hard_inner,
+            skip_soft_gates=soft_inner,
+            skip_conditional_utilization=self._conditional_mean(
+                hard_inner, decision_mask
+            ),
+            skip_soft_conditional_utilization=self._conditional_mean(
+                soft_inner, decision_mask
+            ),
+            combined_block_utilization=hard_inner.mean(dim=(0, 1)),
+        )
 DynamicDepthTransformer = SparseDepthTransformer
 
 
@@ -569,4 +865,6 @@ def build_model(config: ModelConfig) -> TransformerBase:
         return DenseTransformer(config)
     if config.model_type == "mor":
         return MixtureOfRecursionsTransformer(config)
+    if config.model_type == "mor_skip":
+        return MixtureOfRecursionsSkipLayerTransformer(config)
     return SparseDepthTransformer(config)

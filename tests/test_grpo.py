@@ -7,6 +7,7 @@ from losses import (
     clipped_grpo_loss_per_decision,
     grpo_reward,
     group_relative_advantages,
+    masked_density_loss,
 )
 
 
@@ -68,3 +69,14 @@ def test_per_decision_objective_honors_hierarchical_decision_mask() -> None:
     torch.testing.assert_close(loss, torch.tensor(-1.0))
     torch.testing.assert_close(ratio, torch.tensor(1.0))
     torch.testing.assert_close(clipped, torch.tensor(0.0))
+
+
+def test_masked_density_ignores_tokens_not_admitted_by_mor() -> None:
+    gates = torch.tensor(
+        [[[1.0, 0.0], [0.0, 0.0]]], requires_grad=True
+    )
+    eligible = torch.tensor([[[True, True], [False, False]]])
+    loss = masked_density_loss(gates, eligible, target_density=0.5)
+    torch.testing.assert_close(loss, torch.tensor(0.25))
+    loss.backward()
+    assert gates.grad[0, 1].eq(0).all()

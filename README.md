@@ -17,16 +17,18 @@ while using more Transformer blocks.
 
 ## Exact implementation status
 
-The completed fifth experiment is **MoR + recursion-routing GRPO**. GRPO
+The earlier fifth experiment is **MoR + recursion-routing GRPO**. GRPO
 fine-tunes the MoR routers that decide whether each token continues through
 one, two, or three recursions. Because MoR already skips later recursive work
 for filtered tokens, this is a GRPO-controlled form of token skipping.
 
-It is **not yet** the literal two-level hybrid `MoR + SkipLayer + GRPO`. In that
-unimplemented hybrid, MoR would first select the tokens admitted to a recursion
-and an additional independent `[skip, execute]` SkipLayer gate would then act
-inside every shared block application. The current code does not contain that
-second gate, and the results below must not be presented as evidence for it.
+The literal two-level hybrid **MoR + SkipLayer + GRPO is now implemented** as a
+separate architecture named `mor_skip`. MoR first selects the tokens admitted
+to each recursion. Six independent `[skip, execute]` heads then act on the two
+shared blocks across three recursions. Its effective execution rule is
+`MoR_admitted × SkipLayer_execute`; entry and exit blocks remain mandatory.
+Supervised hybrid training and GRPO freeze the pretrained MoR backbone and
+outer routers, updating only the new inner SkipLayer heads.
 
 | System | Implemented | Meaning |
 |---|---:|---|
@@ -35,7 +37,8 @@ second gate, and the results below must not be presented as evidence for it.
 | SkipLayer + GRPO | Yes | GRPO fine-tunes the SkipLayer router |
 | MoR | Yes | Paper-style hierarchical recursive token filtering |
 | MoR + recursion-routing GRPO | Yes | GRPO fine-tunes native MoR continuation decisions |
-| MoR + independent SkipLayer + GRPO | No | Separate SkipLayer gates inside MoR recursions |
+| MoR + independent SkipLayer | Yes | Six separate SkipLayer gates inside MoR recursions |
+| MoR + independent SkipLayer + GRPO | Yes | GRPO fine-tunes only the six inner gates |
 
 ## Completed five-way result
 
@@ -70,7 +73,10 @@ The main observations are:
 - These are one-seed, character-model results. They are not evidence that the
   same ranking or savings will transfer directly to LLM scale.
 
-The complete generated report and raw table are available at
+The table above predates the newly implemented two-level hybrid and therefore
+does not contain a full hybrid result. Do not relabel the existing native
+MoR-GRPO row as the new hybrid. The complete generated report and raw table for
+that earlier comparison are available at
 [results/mor_comparison_seed42/REPORT.md](results/mor_comparison_seed42/REPORT.md)
 and
 [results/mor_comparison_seed42/summary.csv](results/mor_comparison_seed42/summary.csv).
@@ -214,6 +220,37 @@ Open `http://localhost:6006`. Supervised runs log `train`, `validation`, and,
 for MoR, `validation_oracle_topk`. GRPO runs additionally log reward, policy
 ratio/clipping, KL, entropy, achieved depth and FLOPs for every rollout budget,
 plus per-recursion utilization and router diagnostics.
+
+## Literal MoR + SkipLayer + GRPO hybrid
+
+Run supervised inner-gate training, GRPO fine-tuning, evaluation, plots, and
+report regeneration with:
+
+```bash
+python run_mor_skip_hybrid.py
+```
+
+The supervised stage starts from the completed paper-style MoR checkpoint.
+It logs outer MoR admission, conditional inner SkipLayer execution, combined
+block utilization, validation quality, and combined FLOPs. The GRPO stage uses
+conditional inner-execution budgets of `25%`, `50%`, `75%`, and `100%`. The
+`100%` execute-all-MoR-eligible trajectory is a quality anchor excluded from
+the policy loss.
+
+Hybrid GRPO optimizes:
+
+```text
+reward = -sequence_CE - lambda_compute_grpo × combined_MoR_SkipLayer_FLOPs
+```
+
+The exact behavior probability of every eligible inner skip action is retained
+for per-decision PPO clipping. TensorBoard separates:
+
+- `mor_recursion_*_admission`: outer paper-style MoR routing;
+- `skip_r*_b*_conditional_execute`: inner execution among admitted tokens;
+- `combined_r*_b*_utilization`: actual joint execution;
+- `budget_P*_effective_depth`, CE, reward, and FLOPs;
+- policy ratio, clip fraction, KL, entropy, and frozen-parameter gradient norm.
 
 ## GRPO router fine-tuning
 

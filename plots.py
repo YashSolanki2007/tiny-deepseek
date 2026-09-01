@@ -24,6 +24,12 @@ def short_label(item: dict) -> str:
         return f"Full dense L{item.get('n_layers') or 8}"
     if item.get("model") == "mor":
         return "MoR + GRPO" if item.get("training_method") == "grpo" else "MoR"
+    if item.get("model") == "mor_skip":
+        return (
+            "MoR + SkipLayer + GRPO"
+            if item.get("training_method") == "grpo"
+            else "MoR + SkipLayer"
+        )
     if item.get("training_method") == "grpo":
         return "SkipLayer + GRPO"
     return "Supervised SkipLayer"
@@ -95,8 +101,58 @@ def per_experiment_plots(experiment: Path) -> None:
             plots / "recursion_utilization",
         )
 
+    mor_admission_keys = sorted(
+        [
+            key for key in rows[0]
+            if key.startswith("mor_recursion_") and key.endswith("_admission")
+            and "soft" not in key
+        ],
+        key=lambda key: int(key.split("_")[2]),
+    ) if rows else []
+    if mor_admission_keys:
+        plot_series(
+            rows,
+            [(key, f"recursion {key.split('_')[2]}") for key in mor_admission_keys],
+            "Outer MoR admission",
+            "Admitted token fraction",
+            plots / "mor_admission",
+        )
+    conditional_skip_keys = sorted(
+        [
+            key for key in rows[0]
+            if key.startswith("skip_r") and key.endswith("_conditional_execute")
+            and "soft" not in key
+        ]
+    ) if rows else []
+    if conditional_skip_keys:
+        plot_series(
+            rows,
+            [(key, key.removeprefix("skip_").removesuffix("_conditional_execute")) for key in conditional_skip_keys],
+            "Inner SkipLayer execution conditional on MoR admission",
+            "Conditional execute fraction",
+            plots / "inner_skip_conditional_utilization",
+        )
+    combined_keys = sorted(
+        [
+            key for key in rows[0]
+            if key.startswith("combined_r") and key.endswith("_utilization")
+        ]
+    ) if rows else []
+    if combined_keys:
+        plot_series(
+            rows,
+            [(key, key.removeprefix("combined_").removesuffix("_utilization")) for key in combined_keys],
+            "Combined MoR × SkipLayer utilization",
+            "Executed token fraction",
+            plots / "combined_block_utilization",
+        )
+
     budget_depth_keys = sorted(
-        [key for key in rows[0] if key.startswith("budget_") and key.endswith("_depth")],
+        [
+            key for key in rows[0]
+            if key.startswith("budget_") and key.endswith("_depth")
+            and key.split("_")[1].isdigit()
+        ],
         key=lambda key: int(key.split("_")[1]),
     ) if rows else []
     if budget_depth_keys:
@@ -113,6 +169,35 @@ def per_experiment_plots(experiment: Path) -> None:
             "Cross entropy by rollout budget",
             "Cross entropy",
             plots / "budget_rollout_ce",
+        )
+
+    hybrid_budget_keys = sorted(
+        [
+            key for key in rows[0]
+            if key.startswith("budget_P") and key.endswith("_effective_depth")
+        ]
+    ) if rows else []
+    if hybrid_budget_keys:
+        plot_series(
+            rows,
+            [(key, key.split("_")[1] + " inner budget") for key in hybrid_budget_keys],
+            "Hybrid GRPO achieved depths",
+            "Layers/token",
+            plots / "hybrid_budget_rollout_depths",
+        )
+        plot_series(
+            rows,
+            [(key.replace("_effective_depth", "_ce"), key.split("_")[1]) for key in hybrid_budget_keys],
+            "Hybrid GRPO cross entropy by budget",
+            "Cross entropy",
+            plots / "hybrid_budget_rollout_ce",
+        )
+        plot_series(
+            rows,
+            [(key.replace("_effective_depth", "_flops_vs_full_dense"), key.split("_")[1]) for key in hybrid_budget_keys],
+            "Hybrid GRPO FLOPs by budget",
+            "Fraction of full dense",
+            plots / "hybrid_budget_rollout_flops",
         )
 
     summary_path = experiment / "summary.json"

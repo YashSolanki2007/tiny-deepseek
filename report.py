@@ -53,6 +53,12 @@ def model_label(row: dict[str, Any]) -> str:
         return "Dense"
     if row.get("model") == "mor":
         return "MoR + GRPO" if row.get("training_method") == "grpo" else "MoR"
+    if row.get("model") == "mor_skip":
+        return (
+            "MoR + SkipLayer + GRPO"
+            if row.get("training_method") == "grpo"
+            else "MoR + SkipLayer"
+        )
     if row.get("model") == "sparse" and row.get("paper_reproduction"):
         return "SkipLayer + GRPO" if row.get("training_method") == "grpo" else "SkipLayer"
     router = str(row.get("router_type", "unknown")).upper()
@@ -543,7 +549,7 @@ def mor_conclusion(rows: list[dict[str, Any]]) -> str:
         and finite(row.get("estimated_executed_block_flops_per_sequence"))
     ]
     if not complete:
-        return "The five-way comparison is not complete."
+        return "The comparison is not complete."
     best_quality = min(complete, key=lambda row: float(row["val_loss"]))
     best_compute = min(
         complete,
@@ -560,19 +566,35 @@ def mor_conclusion(rows: list[dict[str, Any]]) -> str:
 
 
 def mor_report_markdown(rows: list[dict[str, Any]], experiments_dir: Path) -> str:
+    has_hybrid = any(row.get("model") == "mor_skip" for row in rows)
+    objective = (
+        "This matched Tiny Shakespeare experiment compares full dense, SkipLayer, "
+        "SkipLayer + GRPO, MoR, native MoR recursion-routing GRPO, and the literal "
+        "two-level MoR + SkipLayer hybrid before and after GRPO."
+        if has_hybrid
+        else "This matched Tiny Shakespeare experiment compares the five requested systems: "
+        "a full eight-layer dense Transformer, supervised SkipLayer, SkipLayer + GRPO, "
+        "Mixture-of-Recursions (MoR), and MoR + GRPO."
+    )
+    hybrid_text = (
+        " The two-level hybrid keeps MoR admission fixed and adds six independent "
+        "SkipLayer heads—one for each of the two shared blocks across three recursions. "
+        "Its combined gate is `MoR_admitted × SkipLayer_execute`; entry and exit remain mandatory."
+        if has_hybrid else ""
+    )
     return fr"""# Mixture-of-Recursions + SkipLayer/GRPO Comparison
 
 ## 1. Objective
 
-This matched Tiny Shakespeare experiment compares the five requested systems: a full eight-layer dense Transformer, supervised SkipLayer, SkipLayer + GRPO, Mixture-of-Recursions (MoR), and MoR + GRPO.
+{objective}
 
 ## 2. MoR Architecture
 
-The implementation follows the paper's selected expert-choice design at small scale: Middle-Cycle sharing with `1 + 2×3 + 1 = 8` effective layers, three recursions, capacities `1, 2/3, 1/3`, linear sigmoid routers, scale `α=0.1`, auxiliary BCE coefficient `0.001`, no capacity warmup, and recursion-wise attention/KV restriction. MoR therefore stores four unique Transformer blocks while exposing eight effective layers. Supervised training uses hierarchical top-k routing; greedy evaluation uses the learned `0.5` threshold and is reported separately from oracle top-k validation.
+The implementation follows the paper's selected expert-choice design at small scale: Middle-Cycle sharing with `1 + 2×3 + 1 = 8` effective layers, three recursions, capacities `1, 2/3, 1/3`, linear sigmoid routers, scale `α=0.1`, auxiliary BCE coefficient `0.001`, no capacity warmup, and recursion-wise attention/KV restriction. MoR therefore stores four unique Transformer blocks while exposing eight effective layers. Supervised training uses hierarchical top-k routing; greedy evaluation uses the learned `0.5` threshold and is reported separately from oracle top-k validation.{hybrid_text}
 
 ## 3. GRPO Extension
 
-Both GRPO variants freeze their Transformer weights and update only routing parameters. SkipLayer uses explicit low/medium/full layer budgets. MoR uses one/two/three-recursion budgets, corresponding to nominal effective depths four/six/eight. The full path is a quality anchor excluded from the policy loss. Every sampled action retains its exact behavior probability, and PPO ratios are computed per valid token-routing decision. The final protocol uses PPO clip ε=0.5 because ε=0.2 clipped nearly every controller-guided MoR decision in the smoke test.
+All GRPO variants freeze Transformer weights and update only the router under study. SkipLayer uses explicit layer budgets. Native MoR-GRPO uses recursion budgets. The two-level hybrid keeps the outer MoR router frozen and samples 25/50/75/100% conditional inner-execution budgets; its 100% execute-all-eligible path is the quality anchor excluded from policy loss. Every sampled action retains its exact behavior probability, and PPO ratios are computed only over valid token-routing decisions.
 
 ## 4. Main Results
 
@@ -596,7 +618,7 @@ All FLOPs are forward-pass block estimates. MoR recursion-wise attention scales 
 
 ## 7. Routing Diagnostics
 
-Each routed run contains layer heatmaps, token-skip analyses, difficulty/depth correlations, and per-layer utilization. MoR runs additionally log recursion utilization, soft router probabilities, auxiliary BCE, threshold accuracy, greedy FLOPs, and oracle top-k validation in separate TensorBoard namespaces.
+Each routed run contains layer heatmaps, token-skip analyses, difficulty/depth correlations, and per-layer utilization. MoR runs additionally log recursion utilization, soft router probabilities, auxiliary BCE, threshold accuracy, and greedy FLOPs. Hybrid runs separately log outer admission, conditional inner execution, combined block utilization, and every GRPO rollout budget.
 
 ## 8. Training Dynamics
 
@@ -609,7 +631,7 @@ Each routed run contains layer heatmaps, token-skip analyses, difficulty/depth c
 
 
 def report_markdown(rows: list[dict[str, Any]], experiments_dir: Path) -> str:
-    if any(row.get("model") == "mor" for row in rows):
+    if any(row.get("model") in {"mor", "mor_skip"} for row in rows):
         return mor_report_markdown(rows, experiments_dir)
     if rows and all(bool(row.get("paper_reproduction")) for row in rows):
         return paper_report_markdown(rows, experiments_dir)
