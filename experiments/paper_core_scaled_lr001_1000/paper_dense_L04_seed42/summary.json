@@ -1,0 +1,61 @@
+{
+  "model": "dense",
+  "router_type": "none",
+  "training_method": "supervised",
+  "seed": 42,
+  "target_density": 1.0,
+  "lambda_density": 0.0,
+  "paper_reproduction": true,
+  "density_reduction": "sum",
+  "optimizer_name": "adafactor",
+  "parameter_count": 1344384,
+  "active_parameter_estimate": 1344384.0,
+  "training_time_sec": 59.28583687543869,
+  "seconds_per_step": 0.05607586762681603,
+  "tokens_per_sec": 69089.01376572988,
+  "dense_block_flops_per_sequence": 369098752.0,
+  "estimated_executed_block_flops_per_sequence": 369098752.0,
+  "checkpoint": "experiments/paper_core_scaled_lr001_1000/paper_dense_L04_seed42/checkpoints/best_val_loss.pt",
+  "val_loss": 2.141210126876831,
+  "val_accuracy": 0.37060546875,
+  "density_loss": 0.0,
+  "mean_soft_gate": 1.0,
+  "mean_hard_gate": 1.0,
+  "layers_per_token": 4.0,
+  "compute_fraction": 1.0,
+  "skip_fraction": 0.0,
+  "routing_entropy": 0.0,
+  "val_perplexity": 8.509729252628107,
+  "validation_time_sec": 0.5160850840620697,
+  "layer_utilization": [
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "layer_soft_probability": [
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "generation_tokens_per_sec": 98.68838212282526,
+  "generation_ms_per_token": 10.132904993370175,
+  "pearson_nll_depth": NaN,
+  "spearman_nll_depth": NaN,
+  "difficulty_quantile_depth": [
+    4.0,
+    4.0,
+    4.0,
+    4.0,
+    4.0
+  ],
+  "difficulty_quantile_labels": [
+    "0\u201320%",
+    "20\u201340%",
+    "40\u201360%",
+    "60\u201380%",
+    "80\u2013100%"
+  ],
+  "tokens_analyzed": 20480
+}

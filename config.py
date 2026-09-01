@@ -25,6 +25,14 @@ class ModelConfig:
     paper_reproduction: bool = False
     sparse_inference: bool = False
     tie_weights: bool = True
+    mor_reproduction: bool = False
+    recursion_steps: int = 3
+    recursion_block_layers: int = 2
+    mor_capacity_factors: tuple[float, ...] = (1.0, 2 / 3, 1 / 3)
+    mor_router_alpha: float = 0.1
+    mor_aux_loss_coefficient: float = 0.001
+    mor_capacity_warmup_steps: int = 0
+    mor_recursion_wise_kv: bool = True
 
     def __post_init__(self) -> None:
         if self.model_type == "dynamic":
@@ -33,12 +41,35 @@ class ModelConfig:
             self.router_type = "linear"
         if self.d_model % self.n_heads:
             raise ValueError("d_model must be divisible by n_heads")
-        if self.model_type not in {"dense", "sparse"}:
-            raise ValueError("model_type must be dense or sparse")
+        if self.model_type not in {"dense", "sparse", "mor"}:
+            raise ValueError("model_type must be dense, sparse, or mor")
         if self.router_type not in {"linear", "gru"}:
             raise ValueError("router_type must be linear or gru")
         if not 0 < self.initial_execute_probability < 1:
             raise ValueError("initial_execute_probability must be in (0, 1)")
+        self.mor_capacity_factors = tuple(float(value) for value in self.mor_capacity_factors)
+        if self.model_type == "mor":
+            expected_layers = 2 + self.recursion_steps * self.recursion_block_layers
+            if self.n_layers != expected_layers:
+                raise ValueError(
+                    "MoR effective n_layers must equal 2 + recursion_steps * "
+                    f"recursion_block_layers ({expected_layers})"
+                )
+            if len(self.mor_capacity_factors) != self.recursion_steps:
+                raise ValueError("MoR needs one capacity factor per recursion step")
+            if self.mor_capacity_factors[0] != 1.0:
+                raise ValueError("Every token must traverse the first MoR recursion")
+            if any(
+                not 0 < value <= 1 for value in self.mor_capacity_factors
+            ) or any(
+                later > earlier
+                for earlier, later in zip(
+                    self.mor_capacity_factors, self.mor_capacity_factors[1:]
+                )
+            ):
+                raise ValueError("MoR capacities must be positive and non-increasing")
+            if not 0 < self.mor_router_alpha <= 1:
+                raise ValueError("mor_router_alpha must be in (0, 1]")
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

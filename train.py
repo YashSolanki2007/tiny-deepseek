@@ -19,6 +19,7 @@ from model import TransformerBase, build_model
 from optimizers import FixedDecayAdafactor
 from utils import (
     estimate_dense_block_flops,
+    estimate_mor_flops,
     estimate_skiplayer_flops,
     gradient_norm,
     load_checkpoint,
@@ -41,6 +42,8 @@ BASE_FIELDS = [
     "layers_per_token", "compute_fraction", "skip_fraction", "routing_entropy",
     "learning_rate", "gradient_norm", "router_gradient_norm", "transformer_gradient_norm",
     "tokens_processed", "seconds_per_step", "tokens_per_second", "validation_time_sec",
+    "mor_aux_loss", "mor_router_accuracy", "mean_recursions_per_token",
+    "estimated_block_flops", "estimated_flops_vs_full_dense",
 ]
 
 
@@ -64,9 +67,28 @@ def active_parameter_estimate(model: TransformerBase, density: float) -> float:
     return float(always_active + router_parameters + density * block_parameters)
 
 
+def execution_flop_metrics(
+    model: TransformerBase, metrics: Dict[str, Any]
+) -> tuple[float, float]:
+    dense = estimate_dense_block_flops(model.config, model.config.context_length)
+    if model.config.model_type == "mor":
+        executed = estimate_mor_flops(
+            model.config,
+            model.config.context_length,
+            metrics["recursion_utilization"],
+        )
+    elif model.config.model_type == "sparse" and model.config.paper_reproduction:
+        executed = estimate_skiplayer_flops(
+            model.config, model.config.context_length, metrics["compute_fraction"]
+        )
+    else:
+        executed = dense * metrics["compute_fraction"]
+    return executed, executed / dense
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", choices=["dense", "sparse", "dynamic"], default="sparse")
+    parser.add_argument("--model", choices=["dense", "sparse", "dynamic", "mor"], default="sparse")
     parser.add_argument("--router", choices=["linear", "gru"], default="gru")
     parser.add_argument("--data-path", default="data/input.txt")
     parser.add_argument("--experiment-dir")
@@ -115,6 +137,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         help="Optional scale-adapted Adafactor LR; omitted means the paper's exact 0.1.",
     )
+    parser.add_argument("--recursion-steps", type=int, default=3)
+    parser.add_argument("--recursion-block-layers", type=int, default=2)
+    parser.add_argument(
+        "--mor-capacity-factors", type=float, nargs="+", default=[1.0, 2 / 3, 1 / 3]
+    )
+    parser.add_argument("--mor-router-alpha", type=float, default=0.1)
+    parser.add_argument("--mor-aux-loss-coefficient", type=float, default=0.001)
+    parser.add_argument("--mor-capacity-warmup-steps", type=int, default=0)
     return parser
 
 
@@ -146,8 +176,8 @@ def save_named_checkpoint(
 def main() -> None:
     args = build_parser().parse_args()
     if args.paper_reproduction:
-        if args.model not in {"dense", "sparse"}:
-            raise ValueError("The paper protocol supports dense or sparse models")
+        if args.model not in {"dense", "sparse", "mor"}:
+            raise ValueError("The scaled protocol supports dense, sparse, or MoR models")
         if args.model == "sparse" and args.router != "linear":
             raise ValueError("The SkipLayer paper uses the linear two-class router")
         # Exact reported method/training choices that remain meaningful after
@@ -197,6 +227,13 @@ def main() -> None:
                 paper_reproduction=args.paper_reproduction,
                 sparse_inference=args.paper_reproduction,
                 tie_weights=not args.no_tie_weights,
+                mor_reproduction=model_type == "mor",
+                recursion_steps=args.recursion_steps,
+                recursion_block_layers=args.recursion_block_layers,
+                mor_capacity_factors=tuple(args.mor_capacity_factors),
+                mor_router_alpha=args.mor_router_alpha,
+                mor_aux_loss_coefficient=args.mor_aux_loss_coefficient,
+                mor_capacity_warmup_steps=args.mor_capacity_warmup_steps,
             )
         ).to(device)
 
@@ -225,6 +262,8 @@ def main() -> None:
     density_label = f"P{int(round(cfg.target_density * 100)):03d}"
     default_name = (
         f"dense_seed{cfg.seed}" if model.config.model_type == "dense"
+        else f"mor_R{model.config.recursion_steps}_seed{cfg.seed}"
+        if model.config.model_type == "mor"
         else f"{model.config.router_type}_{density_label}_seed{cfg.seed}"
     )
     experiment_dir = Path(args.experiment_dir or f"experiments/{default_name}")
@@ -258,6 +297,12 @@ def main() -> None:
 
     fields = BASE_FIELDS + [f"layer_{i}_density" for i in range(model.config.n_layers)]
     fields += [f"layer_{i}_soft_probability" for i in range(model.config.n_layers)]
+    if model.config.model_type == "mor":
+        fields += [
+            f"recursion_{i + 1}_{kind}"
+            for i in range(model.config.recursion_steps)
+            for kind in ("utilization", "soft_utilization")
+        ]
     logger = StructuredLogger(
         experiment_dir, fields, purge_step=start_step if resume_checkpoint else None
     )
@@ -268,12 +313,18 @@ def main() -> None:
     measured_step_seconds = 0.0
     training_started = time.perf_counter()
     last_eval: Dict[str, Any] = {}
-    effective_target_density = (
-        cfg.target_density if model.config.model_type == "sparse" else 1.0
-    )
+    if model.config.model_type == "sparse":
+        effective_target_density = cfg.target_density
+    elif model.config.model_type == "mor":
+        expected_depth = 2 + model.config.recursion_block_layers * sum(
+            model.config.mor_capacity_factors
+        )
+        effective_target_density = expected_depth / model.config.n_layers
+    else:
+        effective_target_density = 1.0
     print(
         f"device={device} model={model.config.model_type} "
-        f"router={model.config.router_type if model.config.model_type == 'sparse' else 'none'} "
+        f"router={model.config.router_type if model.config.model_type == 'sparse' else 'expert_linear' if model.config.model_type == 'mor' else 'none'} "
         f"parameters={model.parameter_count():,} experiment={experiment_dir}"
     )
     try:
@@ -288,15 +339,28 @@ def main() -> None:
             synchronize_device(device)
             step_started = time.perf_counter()
             x, y = dataset.get_batch("train", cfg.batch_size, device)
-            output = model(x, y, routing_mode="gumbel")
+            output = model(
+                x,
+                y,
+                routing_mode="topk" if model.config.model_type == "mor" else "gumbel",
+            )
             penalty = (
                 density_loss(
                     output.hard_gates, cfg.target_density,
                     reduction=cfg.density_reduction,
                 )
-                if output.hard_gates is not None else output.lm_loss.new_zeros(())
+                if model.config.model_type == "sparse" else output.lm_loss.new_zeros(())
             )
-            total = output.lm_loss + coefficient * penalty
+            auxiliary = (
+                output.mor_aux_loss
+                if output.mor_aux_loss is not None
+                else output.lm_loss.new_zeros(())
+            )
+            total = (
+                output.lm_loss
+                + coefficient * penalty
+                + model.config.mor_aux_loss_coefficient * auxiliary
+            )
             optimizer.zero_grad(set_to_none=True)
             total.backward()
             router_grad = gradient_norm(router_params)
@@ -311,6 +375,7 @@ def main() -> None:
             measured_step_seconds += step_seconds
             tokens_processed += x.numel()
             route = routing_metrics(output, model.config.n_layers)
+            train_flops, train_flops_relative = execution_flop_metrics(model, route)
             if step % cfg.log_interval == 0 or step == cfg.max_steps - 1:
                 row: Dict[str, Any] = {
                     "split": "train", "train_loss": output.lm_loss.item(),
@@ -323,9 +388,25 @@ def main() -> None:
                     "transformer_gradient_norm": transformer_grad,
                     "tokens_processed": tokens_processed, "seconds_per_step": step_seconds,
                     "tokens_per_second": x.numel() / max(step_seconds, 1e-9), **route,
+                    "mor_aux_loss": auxiliary.item(),
+                    "estimated_block_flops": train_flops,
+                    "estimated_flops_vs_full_dense": train_flops_relative,
                 }
                 row.update({f"layer_{i}_density": v for i, v in enumerate(route["layer_utilization"])})
                 row.update({f"layer_{i}_soft_probability": v for i, v in enumerate(route["layer_soft_probability"])})
+                if model.config.model_type == "mor":
+                    row.update(
+                        {
+                            f"recursion_{i + 1}_utilization": value
+                            for i, value in enumerate(route["recursion_utilization"])
+                        }
+                    )
+                    row.update(
+                        {
+                            f"recursion_{i + 1}_soft_utilization": value
+                            for i, value in enumerate(route["recursion_soft_utilization"])
+                        }
+                    )
                 logger.log(row, step)
                 print(
                     f"step {step:5d} | ce {row['train_loss']:.4f} | ppl {row['train_perplexity']:.3f} "
@@ -339,15 +420,66 @@ def main() -> None:
                     model, dataset, device, cfg.batch_size, cfg.eval_iters,
                     effective_target_density,
                 )
+                eval_flops, eval_flops_relative = execution_flop_metrics(model, last_eval)
                 eval_row = {
                     "split": "validation", "target_density": effective_target_density,
+                    "estimated_block_flops": eval_flops,
+                    "estimated_flops_vs_full_dense": eval_flops_relative,
                     **last_eval,
                 }
                 eval_row.update({f"layer_{i}_density": v for i, v in enumerate(last_eval["layer_utilization"])})
                 eval_row.update({f"layer_{i}_soft_probability": v for i, v in enumerate(last_eval["layer_soft_probability"])})
+                if model.config.model_type == "mor":
+                    eval_row.update(
+                        {
+                            f"recursion_{i + 1}_utilization": value
+                            for i, value in enumerate(last_eval["recursion_utilization"])
+                        }
+                    )
+                    eval_row.update(
+                        {
+                            f"recursion_{i + 1}_soft_utilization": value
+                            for i, value in enumerate(
+                                last_eval["recursion_soft_utilization"]
+                            )
+                        }
+                    )
                 logger.log(eval_row, step)
+                if model.config.model_type == "mor":
+                    oracle_eval = evaluate_model(
+                        model,
+                        dataset,
+                        device,
+                        cfg.batch_size,
+                        cfg.eval_iters,
+                        effective_target_density,
+                        routing_mode="topk",
+                    )
+                    oracle_flops, oracle_relative = execution_flop_metrics(model, oracle_eval)
+                    oracle_row = {
+                        "split": "validation_oracle_topk",
+                        "target_density": effective_target_density,
+                        "estimated_block_flops": oracle_flops,
+                        "estimated_flops_vs_full_dense": oracle_relative,
+                        **oracle_eval,
+                    }
+                    oracle_row.update(
+                        {
+                            f"recursion_{i + 1}_utilization": value
+                            for i, value in enumerate(oracle_eval["recursion_utilization"])
+                        }
+                    )
+                    oracle_row.update(
+                        {
+                            f"recursion_{i + 1}_soft_utilization": value
+                            for i, value in enumerate(
+                                oracle_eval["recursion_soft_utilization"]
+                            )
+                        }
+                    )
+                    logger.log(oracle_row, step)
                 checkpoints = experiment_dir / "checkpoints"
-                score = last_eval["val_loss"] + cfg.quality_compute_alpha * last_eval["compute_fraction"]
+                score = last_eval["val_loss"] + cfg.quality_compute_alpha * eval_flops_relative
                 if last_eval["val_loss"] < best["val_loss"]:
                     best["val_loss"] = last_eval["val_loss"]
                     save_named_checkpoint(checkpoints / "best_val_loss.pt", model, optimizer, scheduler, step + 1, dataset, full_config, best)
@@ -369,21 +501,21 @@ def main() -> None:
 
     training_seconds = time.perf_counter() - training_started
     dense_flops = estimate_dense_block_flops(model.config, model.config.context_length)
-    executed_flops = (
-        estimate_skiplayer_flops(
-            model.config, model.config.context_length, last_eval["compute_fraction"]
-        )
-        if model.config.model_type == "sparse" and model.config.paper_reproduction
-        else dense_flops * last_eval["compute_fraction"]
-    )
+    executed_flops, flops_relative = execution_flop_metrics(model, last_eval)
     summary = {
         "model": model.config.model_type,
-        "router_type": model.config.router_type if model.config.model_type == "sparse" else "none",
+        "router_type": (
+            "expert_linear" if model.config.model_type == "mor"
+            else model.config.router_type if model.config.model_type == "sparse"
+            else "none"
+        ),
         "training_method": "supervised",
         "seed": cfg.seed,
-        "target_density": cfg.target_density if model.config.model_type == "sparse" else 1.0,
+        "target_density": effective_target_density,
         "lambda_density": cfg.lambda_density if model.config.model_type == "sparse" else 0.0,
         "paper_reproduction": model.config.paper_reproduction,
+        "mor_reproduction": model.config.mor_reproduction,
+        "experiment_family": "mor_comparison" if model.config.model_type == "mor" else None,
         "n_layers": model.config.n_layers,
         "effective_target_depth": effective_target_density * model.config.n_layers,
         "learning_rate": cfg.learning_rate,
@@ -391,12 +523,27 @@ def main() -> None:
         "density_reduction": cfg.density_reduction,
         "optimizer_name": cfg.optimizer_name,
         "parameter_count": model.parameter_count(),
-        "active_parameter_estimate": active_parameter_estimate(model, last_eval["compute_fraction"]),
+        "active_parameter_estimate": (
+            model.parameter_count()
+            if model.config.model_type == "mor"
+            else active_parameter_estimate(model, last_eval["compute_fraction"])
+        ),
         "training_time_sec": training_seconds,
         "seconds_per_step": measured_step_seconds / max(cfg.max_steps - start_step, 1),
         "tokens_per_sec": (cfg.max_steps - start_step) * cfg.batch_size * model.config.context_length / max(training_seconds, 1e-9),
         "dense_block_flops_per_sequence": dense_flops,
         "estimated_executed_block_flops_per_sequence": executed_flops,
+        "estimated_flops_vs_full_dense": flops_relative,
+        "recursion_steps": model.config.recursion_steps if model.config.model_type == "mor" else None,
+        "recursion_block_layers": (
+            model.config.recursion_block_layers if model.config.model_type == "mor" else None
+        ),
+        "mor_capacity_factors": (
+            model.config.mor_capacity_factors if model.config.model_type == "mor" else None
+        ),
+        "mor_aux_loss_coefficient": (
+            model.config.mor_aux_loss_coefficient if model.config.model_type == "mor" else None
+        ),
         "checkpoint": str(experiment_dir / "checkpoints" / "best_val_loss.pt"),
         **last_eval,
     }

@@ -40,6 +40,7 @@ BASE_FIELDS = [
     "val_perplexity", "val_accuracy", "mean_soft_gate", "mean_hard_gate",
     "layers_per_token", "compute_fraction", "skip_fraction", "validation_time_sec",
     "estimated_block_flops", "estimated_flops_vs_dense",
+    "estimated_flops_vs_full_dense",
 ]
 
 
@@ -65,11 +66,15 @@ def add_flop_metrics(
     dense_flops = estimate_dense_block_flops(
         effective_depth_dense, model.config.context_length
     )
+    full_dense_flops = estimate_dense_block_flops(
+        model.config, model.config.context_length
+    )
     return {
         **metrics,
         "estimated_executed_block_flops_per_sequence": sequence_flops,
         "estimated_block_flops": sequence_flops,
         "estimated_flops_vs_dense": sequence_flops / dense_flops,
+        "estimated_flops_vs_full_dense": sequence_flops / full_dense_flops,
     }
 
 
@@ -223,7 +228,9 @@ def main() -> None:
     budget_fields = [
         f"budget_{budget}_{metric}"
         for budget in budgets
-        for metric in ("depth", "ce", "reward", "flops_vs_dense")
+        for metric in (
+            "depth", "ce", "reward", "flops_vs_dense", "flops_vs_full_dense"
+        )
     ]
     logger = StructuredLogger(
         experiment_dir,
@@ -335,6 +342,9 @@ def main() -> None:
             dense_flops = estimate_dense_block_flops(
                 dense_reference_config, model.config.context_length
             )
+            full_dense_flops = estimate_dense_block_flops(
+                model.config, model.config.context_length
+            )
             latest_train = {
                 "split": "grpo_train",
                 "mean_reward": rewards.mean().item(),
@@ -374,6 +384,9 @@ def main() -> None:
                         f"budget_{budget}_ce": sequence_ce[selector].mean().item(),
                         f"budget_{budget}_reward": rewards[selector].mean().item(),
                         f"budget_{budget}_flops_vs_dense": budget_flops / dense_flops,
+                        f"budget_{budget}_flops_vs_full_dense": (
+                            budget_flops / full_dense_flops
+                        ),
                     }
                 )
 
@@ -432,7 +445,8 @@ def main() -> None:
                     f"ppl {latest_eval['val_perplexity']:.3f} | depth "
                     f"{latest_eval['layers_per_token']:.2f}/{model.config.n_layers} | "
                     f"skip {100 * latest_eval['skip_fraction']:.1f}% | "
-                    f"FLOPs {latest_eval['estimated_flops_vs_dense']:.3f}x matched dense"
+                    f"FLOPs {latest_eval['estimated_flops_vs_full_dense']:.3f}x full dense "
+                    f"({latest_eval['estimated_flops_vs_dense']:.3f}x matched-depth dense)"
                 )
     finally:
         logger.close()
@@ -463,6 +477,7 @@ def main() -> None:
         "beta_kl": args.beta_kl,
         "depth_budgets": budgets,
         "exploration_epsilon": args.exploration_epsilon,
+        "ppo_clip_epsilon": args.clip_epsilon,
         "parameter_count": model.parameter_count(),
         "active_parameter_estimate": active_parameters,
         "training_time_sec": training_seconds,

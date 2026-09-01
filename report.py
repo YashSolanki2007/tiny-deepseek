@@ -51,6 +51,10 @@ def display(mean: float, std: float, percent: bool = False) -> str:
 def model_label(row: dict[str, Any]) -> str:
     if row.get("model") == "dense":
         return "Dense"
+    if row.get("model") == "mor":
+        return "MoR + GRPO" if row.get("training_method") == "grpo" else "MoR"
+    if row.get("model") == "sparse" and row.get("paper_reproduction"):
+        return "SkipLayer + GRPO" if row.get("training_method") == "grpo" else "SkipLayer"
     router = str(row.get("router_type", "unknown")).upper()
     method = " + GRPO" if row.get("training_method") == "grpo" else ""
     density = row.get("target_density")
@@ -494,7 +498,119 @@ Repeat the matched supervised pair and the selected GRPO point for at least thre
 """
 
 
+def mor_main_table(rows: list[dict[str, Any]]) -> str:
+    dense = [row for row in rows if row.get("model") == "dense"]
+    dense_flops, _ = mean_std(
+        [row.get("estimated_executed_block_flops_per_sequence") for row in dense]
+    )
+    dense_params, _ = mean_std([row.get("parameter_count") for row in dense])
+    headings = [
+        "Model", "Seeds", "Validation CE", "Perplexity", "Layers/token",
+        "Skipped", "Unique parameters", "Params vs dense", "Estimated block FLOPs",
+        "FLOPs vs dense", "Generation tokens/s",
+    ]
+    lines = ["| " + " | ".join(headings) + " |", "|" + "---|" * len(headings)]
+    for label, members in group_rows(rows):
+        ce, ce_std = mean_std([row.get("val_loss") for row in members])
+        ppl, ppl_std = mean_std([row.get("val_perplexity") for row in members])
+        depth, depth_std = mean_std([row.get("layers_per_token") for row in members])
+        skipped, skipped_std = mean_std([row.get("skip_fraction") for row in members])
+        params, params_std = mean_std([row.get("parameter_count") for row in members])
+        flops, flops_std = mean_std(
+            [row.get("estimated_executed_block_flops_per_sequence") for row in members]
+        )
+        speed, speed_std = mean_std([row.get("generation_tokens_per_sec") for row in members])
+        lines.append(
+            "| " + " | ".join(
+                [
+                    label, str(len(members)), display(ce, ce_std), display(ppl, ppl_std),
+                    display(depth, depth_std), display(skipped, skipped_std, True),
+                    f"{params / 1e6:.3f}M ± {params_std / 1e6:.3f}M" if finite(params) else "NaN",
+                    f"{params / dense_params:.3f}×" if finite(params) and finite(dense_params) else "NaN",
+                    f"{flops / 1e6:.1f}M ± {flops_std / 1e6:.1f}M" if finite(flops) else "NaN",
+                    f"{flops / dense_flops:.3f}×" if finite(flops) and finite(dense_flops) else "NaN",
+                    display(speed, speed_std),
+                ]
+            ) + " |"
+        )
+    return "\n".join(lines)
+
+
+def mor_conclusion(rows: list[dict[str, Any]]) -> str:
+    complete = [
+        row for row in rows
+        if finite(row.get("val_loss"))
+        and finite(row.get("estimated_executed_block_flops_per_sequence"))
+    ]
+    if not complete:
+        return "The five-way comparison is not complete."
+    best_quality = min(complete, key=lambda row: float(row["val_loss"]))
+    best_compute = min(
+        complete,
+        key=lambda row: float(row["estimated_executed_block_flops_per_sequence"]),
+    )
+    return (
+        f"The lowest validation CE was produced by {model_label(best_quality)} "
+        f"({float(best_quality['val_loss']):.4f}). The lowest estimated inference FLOPs "
+        f"were produced by {model_label(best_compute)}. These are separate criteria: MoR "
+        "reduces unique parameters through sharing, while routing reduces executed recursion "
+        "work. A point improves the global frontier only if no other model has both lower CE "
+        "and lower paper-style FLOPs."
+    )
+
+
+def mor_report_markdown(rows: list[dict[str, Any]], experiments_dir: Path) -> str:
+    return fr"""# Mixture-of-Recursions + SkipLayer/GRPO Comparison
+
+## 1. Objective
+
+This matched Tiny Shakespeare experiment compares the five requested systems: a full eight-layer dense Transformer, supervised SkipLayer, SkipLayer + GRPO, Mixture-of-Recursions (MoR), and MoR + GRPO.
+
+## 2. MoR Architecture
+
+The implementation follows the paper's selected expert-choice design at small scale: Middle-Cycle sharing with `1 + 2×3 + 1 = 8` effective layers, three recursions, capacities `1, 2/3, 1/3`, linear sigmoid routers, scale `α=0.1`, auxiliary BCE coefficient `0.001`, no capacity warmup, and recursion-wise attention/KV restriction. MoR therefore stores four unique Transformer blocks while exposing eight effective layers. Supervised training uses hierarchical top-k routing; greedy evaluation uses the learned `0.5` threshold and is reported separately from oracle top-k validation.
+
+## 3. GRPO Extension
+
+Both GRPO variants freeze their Transformer weights and update only routing parameters. SkipLayer uses explicit low/medium/full layer budgets. MoR uses one/two/three-recursion budgets, corresponding to nominal effective depths four/six/eight. The full path is a quality anchor excluded from the policy loss. Every sampled action retains its exact behavior probability, and PPO ratios are computed per valid token-routing decision. The final protocol uses PPO clip ε=0.5 because ε=0.2 clipped nearly every controller-guided MoR decision in the smoke test.
+
+## 4. Main Results
+
+{mor_main_table(rows)}
+
+With one seed, `± 0` means across-seed uncertainty is unavailable.
+
+## 5. Quality vs FLOPs
+
+![Validation CE Pareto frontier](pareto_ce.png)
+
+![Validation perplexity Pareto frontier](pareto_perplexity.png)
+
+All FLOPs are forward-pass block estimates. MoR recursion-wise attention scales quadratically with the surviving token fraction because both queries and KV entries are restricted. Python/MPS wall-clock throughput is reported separately and is not an optimized-kernel claim.
+
+## 6. Supervised to GRPO Movement
+
+![Supervised to GRPO movement](sl_vs_grpo.png)
+
+{grpo_assessment(rows)}
+
+## 7. Routing Diagnostics
+
+Each routed run contains layer heatmaps, token-skip analyses, difficulty/depth correlations, and per-layer utilization. MoR runs additionally log recursion utilization, soft router probabilities, auxiliary BCE, threshold accuracy, greedy FLOPs, and oracle top-k validation in separate TensorBoard namespaces.
+
+## 8. Training Dynamics
+
+{training_dynamics(experiments_dir)}
+
+## 9. Conclusion
+
+{mor_conclusion(rows)} This is a one-seed, character-level architecture study and not evidence that the ranking transfers directly to LLM scale.
+"""
+
+
 def report_markdown(rows: list[dict[str, Any]], experiments_dir: Path) -> str:
+    if any(row.get("model") == "mor" for row in rows):
+        return mor_report_markdown(rows, experiments_dir)
     if rows and all(bool(row.get("paper_reproduction")) for row in rows):
         return paper_report_markdown(rows, experiments_dir)
     table, assessment = main_table(group_rows(rows)), grpo_assessment(rows)

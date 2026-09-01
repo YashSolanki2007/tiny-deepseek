@@ -1,0 +1,868 @@
+                                                                        Learning to Skip for Language Modeling
+
+
+                                                    Dewen Zeng 1 Nan Du 1 Tao Wang 1 Yuanzhong Xu 2 Tao Lei 2 Zhifeng Chen 2 Claire Cui 2
+
+
+                                                                  Abstract                                 since we have no control over the amount of computation
+                                                                                                           that can be assigned to each input example.
+                                              Overparameterized large-scale language models
+                                                                                                           In contrast, it is commonly believed that human cogni-
+
+
+
+
+arXiv:2311.15436v1 [cs.CL] 26 Nov 2023
+                                              have impressive generalization performance of
+                                              in-context few-shot learning. However, most lan-             tion (Stanovich & West, 2000; Levy, 2008) uses varying
+                                              guage models allocate the same amount of pa-                 cognitive efforts to operate and learn depending on the ‘hard-
+                                              rameters or computation to each token, disregard-            ness’ of the input. Specifically, one may only need small ef-
+                                              ing the complexity or importance of the input                forts (lower computational cost) to process ‘easy’ examples,
+                                              data. We argue that in language model pretrain-              like the commonly used stop-words, punctuation, patches in
+                                              ing, a variable amount of computation should be              the background of an image, etc., but allow additional efforts
+                                              assigned to different tokens, and this can be effi-          (more computational cost) for ‘hard’ examples, e.g., a rare
+                                              ciently achieved via a simple routing mechanism.             abstract concept for reasoning, when they are truly needed.
+                                              Different from conventional early stopping tech-             Therefore, allocating the same computational power of a
+                                              niques where tokens can early exit at only early             large model uniformly for processing all samples tend to be
+                                              layers, we propose a more general method that dy-            wasteful and less efficient. Such issue might be even more
+                                              namically skips the execution of a layer (or mod-            exacerbated when training large models using real-world
+                                              ule) for any input token with a binary router. In            data corpus in that the redundancy of trivial examples will
+                                              our extensive evaluation across 24 NLP tasks, we             be more pronounced as more and more data are used.
+                                              demonstrate that the proposed method can signifi-            Conditional computation (Bengio et al., 2013; 2015) is the
+                                              cantly improve the 1-shot performance compared               paradigm where only a small subset of the model parame-
+                                              to other competitive baselines only at mild extra            ters are activated based on the input representation, thereby
+                                              cost for inference.                                          reducing the amount of computation needed per example.
+                                                                                                           However, due to the discreteness of the decisions based on
+                                                                                                           each input, training neural networks with conditionally acti-
+                                         1. Introduction                                                   vated components end-to-end differentiably and efficiently
+                                                                                                           is still challenging.
+                                         Transformer-based (Vaswani et al., 2017) large scale lan-
+                                         guage models trained with general corpus have shown               In this paper, we develop a simple framework, referred to
+                                         tremendously improvement of generalization in particular          as the SkipLayer, which allows an input to skip any layer
+                                         with in-context few-shot learning in recent years (Shoeybi        that can be wrapped inside it conditioned on the contex-
+                                         et al., 2019; Brown et al., 2020; Rae et al., 2021; Chowdhery     tual representation. More specifically, SkipLayer-based
+                                         et al., 2022; Hoffmann et al., 2022). Despite of the impres-      models can be trained end-to-end differentiably while at the
+                                         sive capability of text generation, training and serving these    same time the discrete decisions during the forward pass can
+                                         giant models are non-trivial even with the recent progress of     still be respected, which enables us to precisely control the
+                                         hardware and software (Jouppi et al., 2017; Lepikhin et al.,      performance-compute tradeoff through external constraint.
+                                         2021; Patterson et al., 2021). One of the major challenges        Moreover, because the discrete decisions can be preserved
+                                         is that the processing of each input requires to activate all     during the forward pass, we also develop an efficient imple-
+                                         the parameters of a model, which often leads to trillions         mentation so that the additional computation can be further
+                                         of floating point operations (FLOPs) per prediction. This         saved in both pretraining and inference for the given target
+                                         imposes a big burden on both model training and inference         budget. We then apply SkipLayer to the Transformer archi-
+                                            1
+                                                                                                           tecture (Vaswani et al., 2017) to demonstrate the potential
+                                              Work done when Dewen did his internship at Google Research   efficacy of the method for decoder-only language model
+                                         and when Nan and Tao were at Google. 2 Google Brain. Cor-
+                                         respondence to: Nan Du <dunan@apple.com>, Zhifeng Chen            pretraining and decoding. Finally, we extensively validate
+                                         <zhifengc@google.com>.                                            our method on a suite of well established NLP benchmarks
+                                                                                                           ranging from open-domain QA tasks, reading comprehen-
+                                         Preprint version.
+                                                                       Learning to Skip for Language Modeling
+
+                                                            Output                                       X[b, t] ∈ Rd , b ≤ B, t ≤ T , we have that
+                                                                                                                        (
+                                                                                    skip
+      Layer Logic                                                                                            o            F[layer] (X[b, t]) , if G(X[b, t]) = 1.
+                                                                                                          XSL [b, t] =                                            (2)
+                                                      Layer Logic             wa
+                                                                                  rd)                                     X[b, t],             otherwise.
+        Router                                                               (for                ard
+                                             a  rd)                         0.0
+                                                                                                     )
+                                           rw                                                ckw
+                                     (fo                                                                 Therefore, as shown in Figure 1(a), any existing layer ap-
+                               1.0                                )                         (ba
+                                                              ard                                        plied to the input in a pointwise way (e.g., FFN) can be
+                                                           kw                              0.7
+                                                       (bac
+                                                 0.8                                                     easily embedded inside a SkipLayer. Based on the context,
+      Layer Logic
+                                                   ST-Gumbel-Softmax
+                                                                             0.7 0.3
+                                                                                                         if the router decides to skip, the input will be connected
+                           0.2 0.8
+
+                                                            Router
+                                                                                                         directly to the output, otherwise it will go through the em-
+        Router                                                                                           bedded layer logic.
+
+                                                             Input                                       Router Function. Central to the SkipLayer is the router
+         Input
+                                                                                                         function G(X|WG ) which is learned to assign only a subset
+          (a)                                                         (b)                                of inputs to the embedded layer for the best model perfor-
+                                                                                                         mance under a given budget. For a batch of input tokens
+Figure 1. (a) Overview of our SkipLayer framework. The router                                            X ∈ RB×T ×d , the router outputs a binary mask matrix
+can choose to activate or skip the embeded layer logic based on
+the input context. (b) Straight-Through Gumbel-Softmax is used                                                  M = G(X|WG ) ∈ {0, 1}B×T , WG ∈ Rd×2 .             (3)
+for the router. In the forward pass, binary variables are sampled.
+                                                                                                         There are several choices for designing G(X|WG ). One
+During the backward pass, gradients can be backpropagated to
+                                                                                                         choice is the Sigmoid function G(X|WG ) = σ(XWG )
+update the router.
+                                                                                                         that independently normalizes each value to be within the
+                                                                                                         continuous range (0, 1) as the soft approximation to the
+sion, common sense reasoning, to natural language infer-                                                 binary masking. Although this approximation is easy to
+ence tasks. SkipLayer-based models have shown strong                                                     differentiate, it needs an additional threshold to produce the
+1-shot performance with controllable computation tradeoff                                                binary decision rule of Equation 2.
+between model quality and decoding efficiency compared
+                                                                                                         The second design choice is the Top-K (K = 1) routing
+to a variety of competitive baselines.
+                                                                                                         which is widely used in the works of (Du et al., 2022; Lep-
+                                                                                                         ikhin et al., 2021), giving G(X|WG ) = Top-1 (XWG ) =
+2. Method                                                                                                argmax XWG . In order to address the indifferentiability
+                                                                                                         of the argmax operator, as discussed in (Lepikhin et al.,
+In this section, we elaborate on our proposed SkipLayer
+                                                                                                         2021), for each input token X[b, t], we first normalize the
+framework, its efficient implementation, and the application
+                                                                                                         dot-product scores by g = Softmax(X[b, t]WG ) ∈ R2 , and
+to Transformer-based language models.
+                                                                                                         let
+                                                                                                                        (
+2.1. SkipLayer                                                                                               o           g[1] · F[layer] (X[b, t]) , if argmax g = 1.
+                                                                                                          XSL [b, t] =
+       o                                                                                                                 g[0] · X[b, t],             otherwise,
+Let X[layer] = F[layer] (X|W) denote a parameterized layer
+(or module) of a neural network with input X and output                                                                                                             (4)
+X o given an optional set of weights represented by W. For                                               such that the gradients can be backpropgated through the
+instance, a plain FeedForward layer (FFN) can be denoted                                                 coefficients g. Unfortunately, in our experiments, we find
+     o
+as XFFN   = FFFN (X|{W i , W o }) where W i ∈ Rm×h and                                                   that the Top-1 formulation cannot precisely control the spar-
+   o     h×m
+W ∈R           are the input and output weight, respectively.                                            sity of the model (which is crucial to the efficiency) since g
+A SkipLayer FSL is designed to wrap an existing layer such                                               is still a soft approximation of the binary decision rule.
+that                                                                                                     We thus formulate the router with the Straight-Through
+  o
+                                                                                                        Gumbel-Softmax trick shown in Figure 1(b). In the for-
+XSL  = FSL F[layer] (X)|WG                              (1)
+                                                                                                         ward pass, sampled binary values are returned for the gating
+     = F[layer] (X) ⊙ G(X|WG ) + X ⊙ (1 − G(X|WG )),                                                     G(X[b, t]) as in Equation 2. In the backward pass, the soft
+                                                                                                         probabilities are used as g in Equation 4 for the gradients to
+where G(X|WG ) ∈ {0, 1} is a router function with the
+                                                                                                         be propagated back to update the router weights. Because
+learnable weight WG . Figure 1(a) shows the overall frame-
+                                                                                                         during the forward pass we are able to directly calculate
+work.
+                                                                                                         the percentage of the tokens that are not skipped based on
+Given a batch X ∈ RB×T ×d of B sequences, each of length                                                 the binary masking of Equation 3, we can better control the
+T and the embedding dimension d, for each token input                                                    density of the model.
+                                            Learning to Skip for Language Modeling
+
+Router Capacity. The binary mask of the router output in              Input           skip token                                           Output
+Equation 3 is the assignment of a subset of tokens in a batch          …              non-skip token                                        …
+                                                                                      result of non-skip token
+to the embedded layer inside a SkipLayer. For simplicity,
+                                                                                     …
+suppose each sequence in a batch of sizeP      B has the same                                                                …
+                                                  M [i,j]                           group2                                 group2
+sequence length T . Then, the ratio r = i,j      B×T      is the                                   for group in groups:
+                                                                                                     out = FFN(group)
+percentage (or probability) that a token is assigned to the
+layer, which is also referred to as the capacity. Consider P
+as a global budget of how many input tokens can be assigned                                                FFN
+                                                                                   group1                                  group1
+to a layer. Following (Du et al., 2022; LepikhinPet  al., 2021),
+                                                  L
+we introduce an auxiliary loss term ℓaux = i (ri − P )2
+                                                                                               Gsize tokens
+where ri is the capacity of layer i ≤ L, so that each layer
+will respect the budget constraint. The overall loss function
+of the model will be L = ℓnll + λ · ℓaux where ℓnll is the            Gather non-skip tokens                              Scatter non-skip tokens
+
+negative log-likelihood of predicting the next token on aver-
+                                                                   Figure 2. Illustration of efficient SkipLayer implementation. We
+age. By optimizing L, on the one hand, the layer capacity
+                                                                   focus on the sparse computation of FFN, non-skip tokens are
+will be pushed to be closer to the target probability P . On
+                                                                   gathered based on indices generated by the router and then fed into
+the other hand, the ℓaux term will continuously improve the        the FFN as groups. Gsize is a hyper-parameter that controls the
+model’s predictive accuracy. Since the ℓaux term will enforce      group size. The results are scattered to the final output.
+only P percent of tokens in a batch to go with the layer, in
+order to reduce the first term ℓnll , ‘hard’ examples that lead
+to large marginal reduction on average will be prioritized         based on dynamic gather and scatter. The idea is illustrated
+while ‘easy’ examples that already achieve low perplexity          in Figure 2 where we focus on the sparse computation of
+will be skipped in order to save FLOPs.                            a FFN layer since it is a widely used component and often
+                                                                   computationally intensive. The overall algorithm includes
+The router capacity enables the flexibility of controlling the
+                                                                   three major steps.
+performance-computation trade-off. Specifically, we can
+increase the number of layers in total while at the same time
+reduce target probability P to keep the average number of            1. All inputs are marked as skip or non-skip based on
+activated layers roughly the same. This effectively separates           results of the router in Equation 3.
+the increase of model capacity from the computation cost per
+                                                                     2. All non-skipped inputs (in the blue rectangles) are gath-
+prediction, and makes it possible to trade off the increased
+                                                                        ered and evenly partitioned into groups. Although each
+model capacity for better prediction. During serving, we
+                                                                        group will be fed into the FFN for computation se-
+are then able to load the model that can best utilize the
+                                                                        quentially, all the elements in the same group will be
+accelerators’ memory, lead to the highest prediction quality,
+                                                                        gathered, computed, and scattered in parallel.
+and only mildly increase the computation cost while still
+meeting the latency requirement simultaneously.                      3. The compute results from the non-skipped inputs will
+                                                                        be scattered back to the final outputs of this FFN layer,
+2.2. Efficient Implementation                                           while the skipped inputs will be directly written into
+The major advantage of SkipLayer-based models is that the               the final outputs without any computation.
+number of inputs computed by each layer is different across
+the entire stack of layers and continuously varies during          The group size (the number of inputs in a group), denoted
+training. At the same time, this dynamic characteristic is         as Gsize, is a hyper-parameter that controls how many to-
+also challenging for implementation on TPU where com-              kens will be processed by the FFN in parallel. Because the
+putations of tensors with static shapes are often preferred.       number of non-skipped inputs in a batch is dynamic and
+The basic implementation is to first apply the given layer         unknown in advance, Gsize affects the training efficiency.
+logic in Figure 1(a) to the entire batch and then multiply         When Gsize is too large, e.g., there is only one single group,
+the output batch with the mask given by Equation 3 so that         this group may include too many skipped inputs, leading to
+the skipped tokens will not be used in the layer. However,         sub-optimal performance. When Gsize is too small, it will
+this masking mechanism is computational expensive since            produce too many groups of small size, and the computation
+we should not spend the same computations on the skipped           will be close to being sequential. Thus, there will be little
+inputs as those on the non-skipped ones especially when the        parallelism, and the overheads maybe even larger than the
+skip ratio is high.                                                basic masking implementation. In practice, we often set
+                                                                   Gsize ∝ P · BT where P is the target probability, B is the
+We thus develop an efficient SkipLayer implementation
+                                                                   batch size, and T is the sequence length.
+                                                         Learning to Skip for Language Modeling
+
+                                            Output                              most computationally intensive component of a Transformer
+                                                                                model, but can be applied to a batch of tokens in a point-
+                                             FFN
+                                                                                wise manner. Therefore, each input token of a batch can
+                                                                                activate the FFFN layer independently with the probability
+                                                 LN
+                                                                                P . Because FFFN consumes most of the computation in a
+                                                                                Transformer layer, we can thus have big savings in FLOPs
+                     Self attention
+                                             Attn
+                                                                                when the activation probability P is small.
+                                                                                The self-attention layer FAttn consumes much less computa-
+                        key, value           query                              tion relative to the FFFN layer. However, FAttn cannot apply
+                                                                                to a batch of tokens in the pointwise way because tokens
+                                      activate
+                                                                                need to attend to each other to compute their own attention
+                           LN               router
+                                                      skip                      output. If most tokens in a batch are skipped when P is
+                                                                                small, the left non-skipped tokens will lose most of the con-
+                          Token                                                 text of the respective sequences they belong to. We also
+                                                                                empirically observe lower predictive quality when this sim-
+    Figure 3. Overview of our SkipLayer for Transformer-based mod-              ple skipping mechanism is applied. Therefore, we propose
+    els, example of a single layer. LN is the layer normalization layer,        the following partial skipping mechanism. As shown in
+    query, key and value refers to the computation of query, key and            Figure 3, when the input tokens are skipped, their key and
+    value projections in the self-attention layer. Attn is the attention        value projections are still preserved (Line 2 in Algorithm 1)
+    computation. Residual connections in the self attention layer and           since they are part of the context and are needed for the rest
+    FFN layer are ignored for simplicity.                                       non-skipped tokens to further attend to. However, because
+                                                                                the skipped tokens do not require attention calculations by
+    Algorithm 1 Forward pass of SkipLayer                                       themselves, we can still omit their query projections. It
+   Data: A batch of tokens X ∈ RB×T ×d , target probability P .                 is worth to mention that Line 3-11 in Algorithm 1 can be
+1  Get the mask M by Equation 3.                                                computed in parallel using our efficient implementation in
+ 2 Get the key and value projection K ← Fkey (X), V ← Fval (X).
+ 3 for b ≤ B, t ≤ T do
+                                                                                Section 2.2 to increase training speed.
+ 4      if M [b, t] = 1 then                                                    Algorithm 2 shows the greedy decoding logic of one
+ 5           Get the query projection q ← Fquery (X[b, t])
+                                                                                SkipLayer-based Transformer layer. The router makes the
+ 6           x′ ← FAttn (FLN (X[b, t])|K, q, V ) · M [b, t] + X[b, t]
+ 7           XSL [b, t] ← FFFN (FLN (x′ )) + x′                                 skipping decision by picking the most likely outcome. The
+ 8      else                                                                    key and value projections will be computed and saved in
+ 9           XSL [b, t] ← X[b, t]) · (1 − M [b, t])                             the decoding cache (Line 2). Only when the router activates
+10      end                                                                     the current layer, the query projection will be computed for
+11 end                                                                          current token, and then the decoding cache K and V which
+             P                             2
+12 ℓaux ← (     b,t M [b, t]/(B · T ) − P )                                     contain the key and value projections of previous decoding
+13 return XSL , ℓaux                                                            steps will be used to compute the self attention. Otherwise,
+                                                                                there will be no further computations from this layer.
+    2.3. SkipLayer for Transformer-based Models                                 Algorithm 2 SkipLayer per decoding step
+    In this section, we focus in particular on applying SkipLayer             Data: The current state x ∈ Rd , key and value cache K, V
+    to Transformer-based decoder-only language models in the                1 m = G(x|WG ) = argmax x⊤ WG
+                                                                            2 K ← Fkey (x), V ← Fval (x)
+    setup of in-context learning. A Transformer layer mainly                3 if m = 1 then
+    includes the self-attention, layer normalization, and FFN as            4      Get the query projection q ← Fquery (x)
+    the sub-layers, and can be represented as                               5      x′ ← FAttn (FLN (x)|K, q, V ) + x
+                       ′                                                    6      xSL ← FFFN (FLN (x′ )) + x′
+                    X l = FAttn FLN (X l ) + X l ,
+                                            
+                                                                            7 else
+                                           ′        ′                              xSL ← x
+                                                                          8
+                  X l+1 = FFFN FLN (X l ) + X l .             (5)           9 end
+                                                                           10 return: xSL
+    SkipLayer can be applied to a single Transformer layer
+    shown in Figure 3. We propose to wrap the entire Trans-
+    former layer into a SkipLayer to preserve the atomicity of                  3. Experiment Setup
+    the self-attention (FAttn ) → FFN (FFFN ) structure. How-
+    ever, the FAttn layer and the FFFN layer have slightly differ-              We focus on training decoder-only language models. This
+    ent skipping implementations. The FFFN layer is often the                   section elaborates our training setup, hyperparameters, base-
+                                                Learning to Skip for Language Modeling
+
+                                                                        Model Evaluation. To directly evaluate the effectiveness
+Table 1. Architectures and sizes of the models trained in our experi-
+                                                                        of SkipLayer-based models, we mainly follow the 1-shot
+ments. All trained model share the same learning hyperparameters.
+                                                                        learning protocol suggested by (Radford et al., 2018), which
+ Model                          nparams    P          L     Eff-L       is widely used for evaluating the generalization quality of
+ Standard (6L)                  408M       0          6                 pre-trained language models. We evaluate each example in
+ SkipLayer (12, 50%)            766M       50%        12                the development set of a benchmark. For each benchmark,
+                                                               6        only one example will be randomly drawn from that task’s
+ SkipLayer (24, 25%)            1.47B      25%        24
+ SkipLayer (48, 12.5%)          2.92B      12.5%      48                training set as the only demonstration and context, which
+                                                                        will be then concatenated with the evaluation example with
+ Standard (12L)                 766M       0          12
+                                                                        two newlines in between, and then fed into the model. We
+ SkipLayer (24, 50%)            1.47B      50%        24
+                                                              12        use exactly the same prompting format as (Radford et al.,
+ SkipLayer (48, 25%)            2.92B      25%        48
+                                                                        2018) for each downstream benchmark.
+ SkipLayer (96, 12.5%)          5.79B      12.5%      96
+ Standard (24L)                 1.47B      0          24                Benchmarks. We use 24 datasets including four natural
+ SkipLayer (48, 50%)            2.92B      50%        48      24        language generative (NLG) tasks and 20 natural language
+ SkipLayer (96, 25%)            5.79B      25%        96                understanding (NLU) tasks for evaluations. For NLG tasks,
+                                                                        we compare the decoded sequence of tokens by the mod-
+                                                                        els to the ground-truth and report the Exact Match (EM)
+lines, benchmarks, and evaluation protocol.                             accuracy. These tasks are TriviaQA, NQS, WebQS, and
+                                                                        SQuADv2. Greedy decoding is used for each task. All
+Dataset. The pretraining dataset has 1.6 trillion tokens                NLU tasks are formulated into the form of selecting one
+that are representative of a wide range of natural language             correct answer from multiple candidate options. The pre-
+use cases. An in-house classifier is trained to classify be-            diction is based on the maximum log-likelihood of each
+tween a collection of curated text and other web pages so               option given the context log P (option|context) normalized
+that we are able to estimate the content quality of a webpage.          by the token length of each option. These NLU tasks in-
+A high-quality filtered subset of webpages are combined                 clude ANLI (R1, R2, R3), ARC (Easy, Challenge), BoolQ,
+with books, Wikipedia pages, conversations, forums, and                 CB, COPA, Hellaswag, Openbookqa, PIQA, Race (middle,
+news to create the final dataset which is the same as (Du               high), ReCord, RTE, Storycloze, WIC, Winograd, Wino-
+et al., 2022) for training.                                             grande and WSC273. Finally, we use the average of the
+                                                                        scores across all datasets to report the overall 1-shot perfor-
+Model Training. We have trained several variants                        mance of models on both NLG and NLU tasks.
+of SkipLayer-based models and baselines shown in Table 1.
+The model dimension of all the models is 1,536 and the hid-             Baselines. We consider the following baselines to study
+den dimension of the FFN has 8× of the model dimension.                 the effectiveness of SkipLayer-based models.
+The hidden dim of each attention head is 64. nparams is the to-
+                                                                           • Standard base model (STD). The standard Trans-
+tal number of trainable model parameters, L is the total num-
+                                                                             former dense models without any skipping operations.
+ber of Transformer layers, P is the probability of activating
+a layer, and Eff-L is the effective number of layers activated             • WideFFN. Because the FFN often consumes the ma-
+on average. The sequence length is set to 1,024 tokens dur-                  jor computation and has big impact to the predictive
+ing training, and the batch size includes 256 sequences. We                  performance (Kocsis et al., 2022), WideFFN is thus
+set the learning rate to 0.1 for the first 10K training steps and            designed to further double the hidden dimension of the
+then decay following an inverse square root schedule. We                     FFN component. We then apply SkipLayer only to the
+use Adafactor optimizer with first-moment decay β1 = 0                       FFN component without changing the total number of
+and second-moment decay β2 = 0.99. The dropout rate                          layers. As a consequence, when the skipping probabil-
+is set to 0 as the processed tokens are token from an ex-                    ity P = 50%, the compute FLOPs per prediction does
+tremely large training corpus. We use the SentencePiece                      not change due to the 2x FFN size.
+(Kudo & Richardson, 2018) subword tokenizer with a vo-
+                                                                           • HighwayNet (Srivastava et al., 2015) is among the
+cabulary of size of 32K. During training, we use float32 for
+                                                                             first few works that propose to learn a gating function
+model weights and bfloat16 for activations. Aside from the
+                                                                             that could help to train very deep networks efficiently.
+general negative log-likelihood loss, we add the auxiliary
+                                                                             We also apply this idea to the FFN component of the
+loss discussed in Section 2.1 to control the skip ratio of
+                                                                             Transformer layer as one baseline.
+our SkipLayer model, the auxiliary loss weight λ is set to
+0.1. Finally, Gsize is set to 1,024 for all SkipLayer-based                • Random Gating (Rand). Random gating method
+models.                                                                      is the baseline where the learned gating function of
+                                                                                               Learning to Skip for Language Modeling
+
+                                           96L(25%)                                                                                                 10.0                                                                                                                                                                                               6L
+                                                                                                            96L(25%)                                                                                                                                                                                                                          1.25
+                               96L(12.5%)                   48L                                                           48L
+                                                                                               96L(12.5%)
+                  20                                   48L(50%)                     52                             48L(50%)
+                                                                                                                 24L
+                                                 24L                                                                                                                                                                                                                                                                                          1.00
+
+
+
+Avg Score (NLG)
+                                                                                                                                                     7.5
+
+
+
+
+                                                                  Avg Score (NLU)
+                              48L(25%)
+
+
+
+
+                                                                                                                                Time / token (ms)
+                         24L(50%)                                                              48L(25%)
+
+
+                                                                                                                                                                                                                                                                                                                                  Steps / s
+                                                                                                                                                                                                                                                                                                                                                       12L(50%)
+                                                                                           24L(50%)
+                  15                                                                50
+                        48L(12.5%)                                                                                                                   5.0                                                                                                                                                                                      0.75
+                                     12L                                                                                                                                                                                                                                                                                                                           12L
+                                                                                         48L(12.5%)   12L
+
+                                                                                                                                                                                                                                                                                                                                              0.50      24L(25%)
+                                                                                               24L(25%)
+
+
+                                                                                                                                                                                                                             SL (48, 12.5%)                                            SL (96, 12.5%)
+                                                         Base                       48                                 Base                          2.5                                                                                                                                                                                                            24L(50%)         24L
+
+
+                                                                                                                                                                     SL (12, 50%)   SL (24, 25%)              SL (24, 50%)                    SL (48, 25%)              SL (48, 50%)                    SL (96, 25%)
+                  10                                     Eff06                                                         Eff06
+                             12L(50%)
+
+                                                                                                                                                                                                   STD (12)                                                  STD (24)                                                  STD (48)
+                                                         Eff12                             12L(50%)                    Eff12                                                                                                                                                                                                                                             48L(25%)
+                                                                                                                                                           STD (6)
+                                                                                                                                                                                                                                                                                                                                                     48L(12.5%)
+                        6L                               Eff24                            6L                           Eff24                                                                                                                                                                                                                  0.25                              48L(50%)
+                         1          2       3    4 5 6                                     1          2       3    4 5 6                             0.0                                                                                                                                                                                              1.0   1.5    2.0    2.5     3.0
+                          GFlops per token prediction                                       GFlops per token prediction                                                                                              Methods                                                                                                                            GFlops per token prediction
+
+                       (a) Avg. 1-shot (NLG)                                             (b) Avg. 1-shot (NLU)                                      (c) Decoding time per token.                                                                                                                                                                      (d) Training speed.
+
+Figure 4. Average 1-shot performance of different SkipLayer-based models for comparable effective FLOPs per token prediction over the
+NLG tasks (a) and NLU tasks (b). (c) Comparisons of the decoding time per token between the SkipLayer-based models (SL) and the
+respective baseline models (STD). (d) Comparisons of the training speed among models of different density.
+
+
+                       a SkipLayer model is replaced by a pure random func-                                                               In all the cases, it first shows that as the SkipLayer models
+                       tion without learning. This baseline is designed to                                                                become deeper and sparser (keeping the same activated
+                       evaluate the importance of the learned gating function                                                             number of layers), it keeps improving the few-shot learning
+                       to a model’s predictive performance.                                                                               performance at the modest cost of increased FLOPs per
+                                                                                                                                          token prediction. For instance, SkipLayer (24L, 25%) has
+                                                                                                                                          51.5% performance gain at the cost of 18.2% increased
+                                                                                                                                          compute FLOPs compared to the 6L baseline. Similarly,
+4. Full Results
+                                                                                                                                          SkipLayer (48L, 25%) and SkipLayer (96L, 25%) have 28%
+We have conducted comprehensive evaluation of the effec-                                                                                  and 22% at the cost of 19.2% and 20% compared to the 12L
+tiveness of SkipLayer and report the quantitative results                                                                                 and 24L baselines, respectively. Moreover, in Figure 4(a) we
+compared to different baselines in this section.                                                                                          can also observe that even though SkipLayer (48L, 12.5%)
+                                                                                                                                          has less compute FLOPs compared to the 12L baseline, it
+                                                                                                                                          has achieved pretty close 1-shot performance. Similarly,
+How does SkipLayer perform in 1-shot learning?
+                                                                                                                                          SkipLayer (96L, 12.5%) has even better 1-shot performance
+SkipLayer allows each input to selectively activate a partic-
+                                                                                                                                          compared to the 24L baseline by using less compute FLOPs.
+ular layer depending on the context. By keeping the average
+                                                                                                                                          This verifies that we are able to trade off model capacity
+number of activated layers constant while increasing the to-
+                                                                                                                                          for better predictive quality. Likewise, Figure 4(b) shows
+tal number of layers of a language model, we expect that the
+                                                                                                                                          similar patterns that increased model capacity can lead to
+increased model capacity can improve the predictive quality
+                                                                                                                                          better predictive quality across the NLU tasks while at the
+of few-shot learning. Thus, in Figure 4(a-b), we first re-
+                                                                                                                                          cost of modest increased FLOPs.
+port the average 1-shot performance of different SkipLayer
+models. In Figure 4(a), the y-axis is the average 1-shot per-
+formance of all the NLG tasks, and the x-axis (log-scale) is                                                                             Does SkipLayer decode and train efficiently? As shown
+the compute FLOPs per token during the forward-pass. The                                                                                 in Figure 4(a-b), deeper and sparser SkipLayer models have
+black line first shows the performance of the standard base-                                                                             consistent performance improvement in few-shot learning.
+line models of 6, 12, 24 and 48 layers, respectively. For each                                                                           We are also interested in studying if they are able to decode
+baseline model of a particular number of layers, e.g., 6L, we                                                                            and train fast. Figure 4(c) compares the decoding time per
+report the performance of the respective SkipLayer models                                                                                token of different models using a single TPU v3 chip. It
+of comparable compute FLOPs. For example, the three yel-                                                                                 shows that SkipLayer (12, 50%) has nearly the same per-step
+low dots represent the SkipLayer models of 12 layers (12L)                                                                               decoding time as the baseline 6L. SkipLayer (24, 50%) also
+with 50% density, 24 layers (24L) with 25% density, and 48                                                                               has similar speed as the baseline 12L. SkipLayer (48, 50%)
+layers (48L) with 12.5% density, respectively. Compared to                                                                               has 8% 1-shot performance gain at the cost of 6% increase
+the 6L baseline model, all these three SkipLayer models (in                                                                              in the per-step decoding time compared to the baseline 24L.
+yellow) have the same average number of activated layers                                                                                 As the models become deeper, the per-step decoding time
+of six (Effective number of layers) denoted as Eff06. Sim-                                                                               also increases. However, we may find some good trade-
+ilarly, the orange line (Eff12) and red line (Eff24) denote                                                                              off between quality and speed. For example, SkipLayer
+the SkipLayer models with 12 and 24 average number of                                                                                    (96, 25%) has achieved 20% decoding efficiency with a
+activated layers, accordingly.                                                                                                           tiny quality loss of only 0.5% compared to the baseline 48L.
+                                                                                                                                                                                                   Learning to Skip for Language Modeling
+
+                                                                                                                                                                                                                                                                                                                         51                                                                                                                      51
+
+
+
+
+                                                                                                                                                                                                                                                                                 SkipLayer (48, 25%)
+                  15
+
+
+
+
+                                                                                                                                                                                                                                                     SkipLayer (24, 50%)                                                                                                                                                                                                                                   SkipLayer (24, 50%)   SkipLayer (48, 25%)
+                                                                                                                                                                     15
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      Standard   WideFFN
+
+
+                                                                                                               SkipLayer (24, 25%)
+                                                                                                                                                                                                                                        Standard
+                                                                                                                                                                                                                                                                                                                         48                                                                                                                      48
+
+
+
+
+Avg Score (NLG)                                                                                                                                    Avg Score (NLG)                                                                                                                                     Avg Score (NLU)                                                                                    SkipLayer(24, 25%)   Avg Score (NLU)
+                                                                                                                                                                                                                        WideFFN
+                  10
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                                                                     SkipLayer(12, 50%)
+                                                                                                                                                                                                                                                                                                                                                                          Standard
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                   Random (24, 50%)
+                                                                                                                                                                     10
+
+
+
+
+                                                                                                                                                                                                   Random (24, 50%)
+                                                                                        SkipLayer (12, 50%)
+                                                                           WideFFN                                                                                                                                                                                                                                                                              WideFFN
+                                                                                                                                                                                                                                                                                                                         45                                                                                                                      45
+
+
+                                                             HighwayNet
+                                                  Standard
+
+                                                                                                                                                                                HighwayNet                                                                                                                                                         HighwayNet                                                                                         HighwayNet
+
+                              Random (12, 50%)
+                       5
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                Random (12, 50%)
+                                                                                                                                                                      5
+
+                                                                                                                                                                                                                                                                                                                         42                                                                                                                      42
+
+
+
+                       0                                                                                                                                              0
+
+                                                             Methods                                                                                                                                                    Methods                                                                                                                                 Methods                                                                                                               Methods
+
+                           (a) Avg. 1-shot (NLG, 6L)                                                                                                                  (b) Avg. 1-shot (NLG, 12L)                                                                                                                              (c) Avg. 1-shot (NLU, 6L)                                                                                           (d) Avg. 1-shot (NLU, 12L)
+
+Figure 5. Average 1-shot NLG and NLU performance of different methods with 6 (a-b) and 12 (c-d) effective number of activated layers,
+respectively.
+
+
+                       20
+                                                                                                                                                                                                                                                                                                                very deep FFN only networks. However, residual branch is
+                                                                                                                                                                                                                                                                                                                quite normal in today’s Transformer models, self-attention
+                                                                                                                                                       50.0
+                                                                                                                                                                                                                                                                                                                and FFN both have residuals. In our implementation, we
+
+     Avg Score (NLG)                                                                                                                 Avg Score (NLU)
+                       15
+                                                                                                                                                                                                                                                                                                                replace the original residual with the highway network resid-
+                                                                                                                                                       47.5
+                                                                                                                                                                                                                                                                                                                ual which leads to performance degradation. Figure 5(c-d)
+                       10
+                                                                                                                                                                                                                                                                                                                further compare the average 1-shot performance of different
+                                                                                     SkipLayer(24)
+                                                                                     L24Rand
+                                                                                                                                                       45.0                                                                                    SkipLayer(24)
+                                                                                                                                                                                                                                               L24Rand
+                                                                                                                                                                                                                                                                                                                methods across all the NLU tasks. With a similar trend ob-
+                                                                                     SkipLayer(48)
+                                                                                     L48Rand
+                                                                                                                                                                                                                                               SkipLayer(48)
+                                                                                                                                                                                                                                               L48Rand
+                                                                                                                                                                                                                                                                                                                served before, WideFFN has a scaling performance closer
+                            12%                  25%
+                                                             Density
+                                                                          50%                                 75%                                                         12%                25%
+                                                                                                                                                                                                                      Density
+                                                                                                                                                                                                                                  50%                                      75%                                  to the standard baseline models of 12 layers, both of which
+                                                                                                                                                                                                                                                                                                                significantly outperform the HighwayNet and the Random
+                            (a) Avg. 1-shot (NLG)                                                                                                                    (b) Avg. 1-shot (NLU)
+                                                                                                                                                                                                                                                                                                                gating method, and SkipLayer based models lead to the best
+                                                                                                                                                                                                                                                                                                                performance overall when the models scale up.
+Figure 6. Learned gating has significantly better performance than
+the respective methods using random gating.
+                                                                                                                                                                                                                                                                                                               Does the learned gating matter? The gating function
+                                                                                                                                                                                                                                                                                                               inside a SkipLayer enables each input example to activate a
+Figure 4(d) further shows the training speed on a single TPU                                                                                                                                                                                                                                                   subset of layers of the model based on the context. We have
+v4 of different SkipLayer models. In general, the training                                                                                                                                                                                                                                                     already observed that this flexibility of switching model
+speed decreases as more FLOPs are used per prediction.                                                                                                                                                                                                                                                         parameters improve the predictive accuracy of the model
+Compared to the respective full dense baselines, SkipLayer                                                                                                                                                                                                                                                     when it becomes deeper and sparser. We wonder how much
+(24, 50%) has 18% speed gains, and SkipLayer (48, 12.5%)                                                                                                                                                                                                                                                       gain the learned routing function can contribute to the pre-
+has 3x gains.                                                                                                                                                                                                                                                                                                  dictive performance of the SkipLayer-based models. We
+                                                                                                                                                                                                                                                                                                               approach this question by comparing the SkipLayer-based
+How does SkipLayer compare to the baselines? Fig-                                                                                                                                                                                                                                                              models with the respective Random gating baselines where
+ure 5(a-b) first compare the average 1-shot performance of                                                                                                                                                                                                                                                     the gating is not learned by varying the density of the model
+different methods of effective 6 layers and 12 layers across                                                                                                                                                                                                                                                   side-by-side in Figure 6. Because each token activates a
+all the NLG tasks. In Figure 5(a) when all models are small,                                                                                                                                                                                                                                                   layer randomly and independently, Random gating baselines
+HighwayNet has similar performance as the standard base-                                                                                                                                                                                                                                                       have the similar compute FLOPs per token prediction as
+line 6L model. They both outperform the Random gating                                                                                                                                                                                                                                                          the SkipLayer-based models given the same model density.
+method but marginally underperform the WideFFN method.                                                                                                                                                                                                                                                         However, as shown in Figure 6, for the same model density,
+When all the models become deeper in Figure 5(b), the stan-                                                                                                                                                                                                                                                    the learned gating of SkipLayer-based models performs
+dard baseline 12L scales better than WideFFN, HighwayNet                                                                                                                                                                                                                                                       significantly better than the respective methods using ran-
+and the Random gating method. However, in both cases,                                                                                                                                                                                                                                                          dom gating. Even though Random gating baselines also
+SkipLayer based models have achieved the best performance                                                                                                                                                                                                                                                      have the flexibility of switching model parameters per token
+compared to all the other baselines. HighwayNet performs                                                                                                                                                                                                                                                       prediction, Figure 6 verifies that the learned gating functions
+the worst among all the models we trained, one possible                                                                                                                                                                                                                                                        are much more effective to improve the prediction accuracy.
+reason could be Highway network is designed for FFN only
+architectures, it works like a weighted residual branch added                                                                                                                                                                                                                                                   How does the skipping behave during decoding? To
+to the wrapped layer, which helps the training stability of                                                                                                                                                                                                                                                     study the skipping behaviour of SkipLayer model and un-
+                                                Learning to Skip for Language Modeling
+
+                           to                Best                    ness of the activating decisions, soft-approximations and RL-
+            ed            d e
+    a on            son                    us                        based implementations has been explored in the vision (Sri-
+                                ran                                  vastava et al., 2015; Wang et al., 2018) and NLP (Bapna
+                  one      al         u ph i                         et al., 2020) community. Our approach is closer to the sec-
+          non                 of                                     ond learning approach but differ in that SkipLayer does
+                                 San States          No   andy
+       Cup       now      m                                          not require the soft-approximation during the forward pass,
+        er                                     g                     giving computational savings not just in inference but also
+                 t      ie                                           during training. This difference is crucial since pretraining
+                         an           ara                            language models is often time consuming and costly.
+               ing        or              Kingdom
+                   Paris ve Sea flow              ll        little
+                                                           ar        Additionally, concurrent work such as CODA (Lei et al.,
+              Senate                                                 2023) and CoLT5 (Ainslie et al., 2023) have applied simi-
+                                                                     lar token selection method to activate Transformer layers.
+                                                                     However, these work only apply conditional activation in
+Figure 7. Bubble chart of the skipping behaviour of tokens during    the encoder layers of an encoder-decoder model such as T5.
+greedy decoding on TriviaQA dataset using our SkipLayer (12L,
+50%) model. Each dot represents a token, larger dot size means
+more layers are skipped. Black/Red texts show some tokens that
+                                                                     Mixture of Experts have recently been proposed to im-
+skip the most/least layers.                                          prove model efficiency (Shazeer et al., 2017; Gross et al.,
+                                                                     2017; Lepikhin et al., 2021; Fedus et al., 2021; Roller et al.,
+                                                                     2021; Du et al., 2022; Artetxe et al., 2021; Lewis et al., 2021;
+derstand what kind of tokens skip more layers than others            Zhou et al., 2022; Rajbhandari et al., 2022) by sparsely acti-
+during greedy decoding, we collected the skipping statistics         vating a subset of experts in a MoE layer.
+of the decoding results of 500 sampled questions in Trivi-           Our approach is orthogonal to MoE models in that an MoE
+aQA using our SkipLayer (12L, 50%) model. In Figure 7,               layer can be easily wrapped by the SkipLayer for additional
+we plotted the bubble chart of 300 frequently used tokens            efficiency. Moreover, SkipLayer can apply conditional com-
+in the decoding results according to their averaged number           putation to both the self-attention and the Feed-Forward
+of skipped layers (One token may have different skipping             (FFN) component of a Transformer layer, whereas MoE
+patterns under different contexts). Larger dots in the figure        models mainly focus on conditionally activating the FFN
+represents more layers are skipped. We can observe that              component in a MoE layer.
+tokens that skip the most are mainly functional words like
+“and”, “to”, “ed” or “ing”. These tokens can be easily in-
+                                                                     Structural Dropout (Tompson et al., 2015; Ghiasi et al.,
+ferred from the previous contexts and thus do not need much
+                                                                     2018; Dai et al., 2019; Fan et al., 2019; Zeng et al., 2021)
+computation to decode. While tokens that skip less are usu-
+                                                                     randomly drops a group of weights, e.g., a layer (Fan et al.,
+ally independent words like “No” or “Paris”. This indeed
+                                                                     2019), during training to achieve better generalization and
+shows that our SkipLayer model can successfully identify
+                                                                     robustness for pruning during inference. However, the
+such tokens and assign proper computation accordingly.
+                                                                     amount of computation during inference is still uniform
+                                                                     per example. In contrast, SkipLayer-based models learn the
+5. Related Work                                                      skipping patterns from the data which shows better perfor-
+                                                                     mance than the random skipping baseline, and potentially
+Conditional Computation (Bengio et al., 2013; 2015)
+                                                                     assign non-uniform amount of computation to each example
+is a paradigm where only a subset of model parameters can
+                                                                     during inference.
+be activated per input example. Early-exit is one kind of
+implementation for conditional computation where external
+classifiers equipped with confidence-based thresholding are          6. Conclusions
+used to exit early without going through the whole stack
+                                                                     We propose a new general method named SkipLayer for dy-
+of layers (Wang et al., 2017; Xin et al., 2020; Schwartz
+                                                                     namically skipping the execution of arbitrary layers based
+et al., 2020; Liu et al., 2020; Dabre et al., 2020; Elbayad
+                                                                     on the input context using a simple routing algorithm. This
+et al., 2020; Schuster et al., 2022). Unlike these approaches
+                                                                     method enables heterogeneous computation for tokens at dif-
+where the computation is activated for the bottom layers,
+                                                                     ferent complexity or importance so that more computation
+SkipLayer-based models technically allows each input to
+                                                                     resources can be used for improving the predictive quality
+explore 2L different compute paths for a model with L
+                                                                     of harder tokens. Our model demonstrates significant 1-shot
+stacked layers.
+                                                                     performance improvement across 24 NLP tasks compared
+An alternative technique is to enable the model to ‘learn’           to other competitive baselines with only a small extra cost
+how to activate its different sub-layers. Due to the discrete-       for inference.
+                                          Learning to Skip for Language Modeling
+
+References                                                        Lim, H., Zoph, B., Spiridonov, A., Sepassi, R., Do-
+                                                                  han, D., Agrawal, S., Omernick, M., Dai, A. M., Pil-
+Ainslie, J., Lei, T., de Jong, M., Ontañón, S., Brahma, S.,
+                                                                  lai, T. S., Pellat, M., Lewkowycz, A., Moreira, E.,
+  Zemlyanskiy, Y., Uthus, D., Guo, M., Lee-Thorp, J., Tay,
+                                                                  Child, R., Polozov, O., Lee, K., Zhou, Z., Wang, X.,
+  Y., et al. Colt5: Faster long-range transformers with
+                                                                  Saeta, B., Diaz, M., Firat, O., Catasta, M., Wei, J.,
+  conditional computation. In Proceedings of the 2023
+                                                                  Meier-Hellstern, K., Eck, D., Dean, J., Petrov, S., and
+  Conference on Empirical Methods in Natural Language
+                                                                  Fiedel, N. Palm: Scaling language modeling with path-
+  Processing (EMNLP), 2023.
+                                                                  ways. 2022. doi: 10.48550/ARXIV.2204.02311. URL
+Artetxe, M., Bhosale, S., Goyal, N., Mihaylov, T., Ott, M.,       https://arxiv.org/abs/2204.02311.
+  Shleifer, S., Lin, X. V., Du, J., Iyer, S., Pasunuru, R.,
+  Anantharaman, G., Li, X., Chen, S., Akin, H., Baines, M.,     Dabre, R., Rubino, R., and Fujita, A. Balancing cost and
+  Martin, L., Zhou, X., Koura, P. S., O’Horo, B., Wang, J.,       benefit with tied-multi transformers. In Birch, A., Finch,
+  Zettlemoyer, L., Diab, M., Kozareva, Z., and Stoyanov,          A. M., Hayashi, H., Heafield, K., Junczys-Dowmunt, M.,
+  V. Efficient large scale language modeling with mixtures        Konstas, I., Li, X., Neubig, G., and Oda, Y. (eds.), Pro-
+  of experts. 2021. URL https://arxiv.org/abs/                    ceedings of the Fourth Workshop on Neural Generation
+  2112.10684.                                                     and Translation, NGT@ACL 2020, Online, July 5-10,
+                                                                  2020, pp. 24–34. Association for Computational Linguis-
+Bapna, A., Arivazhagan, N., and Firat, O. Controlling             tics, 2020. doi: 10.18653/v1/2020.ngt-1.3. URL https:
+  computation versus quality for neural sequence models,         //doi.org/10.18653/v1/2020.ngt-1.3.
+  2020.
+                                                                Dai, Z., Chen, M., Gu, X., Zhu, S., and Tan, P. Batch drop-
+Bengio, E., Bacon, P., Pineau, J., and Precup, D. Conditional     block network for person re-identification and beyond. In
+  computation in neural networks for faster models. CoRR,         Proceedings of the IEEE/CVF international conference
+  abs/1511.06297, 2015. URL http://arxiv.org/                     on computer vision, pp. 3691–3701, 2019.
+  abs/1511.06297.
+Bengio, Y., Léonard, N., and Courville, A. C. Estimating       Du, N., Huang, Y., Dai, A. M., Tong, S., Lepikhin, D., Xu,
+  or propagating gradients through stochastic neurons for        Y., Krikun, M., Zhou, Y., Yu, A. W., Firat, O., Zoph, B.,
+  conditional computation. CoRR, abs/1308.3432, 2013.             Fedus, L., Bosma, M. P., Zhou, Z., Wang, T., Wang, E.,
+  URL http://arxiv.org/abs/1308.3432.                            Webster, K., Pellat, M., Robinson, K., Meier-Hellstern,
+                                                                  K., Duke, T., Dixon, L., Zhang, K., Le, Q., Wu, Y., Chen,
+Brown, T., Mann, B., Ryder, N., Subbiah, M., Kaplan,              Z., and Cui, C. GLaM: Efficient scaling of language mod-
+  J. D., Dhariwal, P., Neelakantan, A., Shyam, P., Sastry,        els with mixture-of-experts. In Proceedings of the 39th
+  G., Askell, A., Agarwal, S., Herbert-Voss, A., Krueger,         International Conference on Machine Learning, volume
+  G., Henighan, T., Child, R., Ramesh, A., Ziegler, D.,          162 of Proceedings of Machine Learning Research, pp.
+  Wu, J., Winter, C., Hesse, C., Chen, M., Sigler, E.,            5547–5569. PMLR, 17–23 Jul 2022. URL https://
+  Litwin, M., Gray, S., Chess, B., Clark, J., Berner, C.,         proceedings.mlr.press/v162/du22c.html.
+  McCandlish, S., Radford, A., Sutskever, I., and Amodei,
+  D. Language models are few-shot learners. In Larochelle, Elbayad, M., Gu, J., Grave, E., and Auli, M. Depth-adaptive
+  H., Ranzato, M., Hadsell, R., Balcan, M. F., and Lin,      transformer. In 8th International Conference on Learn-
+  H. (eds.), Advances in Neural Information Processing       ing Representations, ICLR 2020, Addis Ababa, Ethiopia,
+  Systems, volume 33, pp. 1877–1901. Curran Asso-            April 26-30, 2020. OpenReview.net, 2020. URL https:
+  ciates, Inc., 2020. URL https://proceedings.               //openreview.net/forum?id=SJg7KhVKPH.
+  neurips.cc/paper/2020/file/
+  1457c0d6bfcb4967418bfb8ac142f64a-Paper. Fan, A., Grave, E., and Joulin, A. Reducing transformer
+  pdf.                                                       depth on demand with structured dropout. arXiv preprint
+                                                             arXiv:1909.11556, 2019.
+Chowdhery, A., Narang, S., Devlin, J., Bosma, M., Mishra,
+  G., Roberts, A., Barham, P., Chung, H. W., Sutton,       Fedus, W., Zoph, B., and Shazeer, N. Switch transform-
+  C., Gehrmann, S., Schuh, P., Shi, K., Tsvyashchenko,       ers: Scaling to trillion parameter models with simple and
+  S., Maynez, J., Rao, A., Barnes, P., Tay, Y., Shazeer,     efficient sparsity. CoRR, abs/2101.03961, 2021. URL
+  N., Prabhakaran, V., Reif, E., Du, N., Hutchinson, B.,     https://arxiv.org/abs/2101.03961.
+  Pope, R., Bradbury, J., Austin, J., Isard, M., Gur-Ari,
+  G., Yin, P., Duke, T., Levskaya, A., Ghemawat, S.,       Ghiasi, G., Lin, T.-Y., and Le, Q. V. Dropblock: A regular-
+  Dev, S., Michalewski, H., Garcia, X., Misra, V., Robin-    ization method for convolutional networks. Advances in
+  son, K., Fedus, L., Zhou, D., Ippolito, D., Luan, D.,      neural information processing systems, 31, 2018.
+                                            Learning to Skip for Language Modeling
+
+Gross, S., Ranzato, M., and Szlam, A. Hard mixtures of               6035–6044, Online, July 2020. Association for Compu-
+  experts for large scale weakly supervised vision. In Pro-          tational Linguistics. doi: 10.18653/v1/2020.acl-main.
+  ceedings of the IEEE Conference on Computer Vision                 537. URL https://aclanthology.org/2020.
+  and Pattern Recognition, pp. 6865–6873, 2017.                      acl-main.537.
+Hoffmann, J., Borgeaud, S., Mensch, A., Buchatskaya, E.,           Patterson, D., Gonzalez, J., Le, Q., Liang, C., Munguia, L.-
+  Cai, T., Rutherford, E., de las Casas, D., Hendricks, L. A.,       M., Rothchild, D., So, D., Texier, M., and Dean, J. Car-
+ Welbl, J., Clark, A., Hennigan, T., Noland, E., Millican,           bon emissions and large neural network training. arXiv
+  K., van den Driessche, G., Damoc, B., Guy, A., Osindero,           preprint arXiv:2104.10350, 2021.
+  S., Simonyan, K., Elsen, E., Vinyals, O., Rae, J. W., and
+  Sifre, L. An empirical analysis of compute-optimal large         Radford, A., Wu, J., Child, R., Luan, D., Amodei,
+  language model training. In Oh, A. H., Agarwal, A.,                D., and Sutskever, I.       Language models are
+  Belgrave, D., and Cho, K. (eds.), Advances in Neural               unsupervised multitask learners.   2018.   URL
+ Information Processing Systems, 2022. URL https:                    https://d4mucfpksywv.cloudfront.
+ //openreview.net/forum?id=iBBcRUlOAPR.                              net/better-language-models/
+                                                                     language-models.pdf.
+Jouppi, N. P., Young, C., Patil, N., Patterson, D., Agrawal,
+  G., Bajwa, R., Bates, S., Bhatia, S., Boden, N., Borchers,       Rae, J. W., Borgeaud, S., Cai, T., Millican, K., Hoffmann, J.,
+  A., et al. In-datacenter performance analysis of a tensor          Song, H. F., Aslanides, J., Henderson, S., Ring, R., Young,
+  processing unit. In Proceedings of the 44th Annual Inter-          S., Rutherford, E., Hennigan, T., Menick, J., Cassirer, A.,
+  national Symposium on Computer Architecture, pp. 1–12,             Powell, R., van den Driessche, G., Hendricks, L. A.,
+  2017.                                                              Rauh, M., Huang, P., Glaese, A., Welbl, J., Dathathri, S.,
+                                                                     Huang, S., Uesato, J., Mellor, J., Higgins, I., Creswell,
+Kocsis, P., Súkenı́k, P., Brasó, G., Nießner, M., Leal-Taixé,     A., McAleese, N., Wu, A., Elsen, E., Jayakumar, S. M.,
+  L., and Elezi, I. The unreasonable effectiveness of fully-         Buchatskaya, E., Budden, D., Sutherland, E., Simonyan,
+  connected layers for low-data regimes. In Proc. NeurIPS,           K., Paganini, M., Sifre, L., Martens, L., Li, X. L., Kun-
+  2022.                                                              coro, A., Nematzadeh, A., Gribovskaya, E., Donato, D.,
+Kudo, T. and Richardson, J. Sentencepiece: A simple and              Lazaridou, A., Mensch, A., Lespiau, J., Tsimpoukelli,
+  language independent subword tokenizer and detokenizer             M., Grigorev, N., Fritz, D., Sottiaux, T., Pajarskas, M.,
+  for neural text processing. In EMNLP, 2018.                        Pohlen, T., Gong, Z., Toyama, D., de Masson d’Autume,
+                                                                     C., Li, Y., Terzi, T., Mikulik, V., Babuschkin, I., Clark,
+Lei, T., Bai, J., Brahma, S., Ainslie, J., Lee, K., Zhou,            A., de Las Casas, D., Guy, A., Jones, C., Bradbury, J.,
+  Y., Du, N., Zhao, V. Y., Wu, Y., Li, B., Zhang, Y., and            Johnson, M., Hechtman, B. A., Weidinger, L., Gabriel,
+  Chang, M.-W. Conditional adapters: Parameter-efficient             I., Isaac, W. S., Lockhart, E., Osindero, S., Rimell, L.,
+  transfer learning with fast inference. In Advances in              Dyer, C., Vinyals, O., Ayoub, K., Stanway, J., Bennett,
+  Neural Information Processing Systems, 2023.                       L., Hassabis, D., Kavukcuoglu, K., and Irving, G. Scal-
+                                                                     ing language models: Methods, analysis & insights from
+Lepikhin, D., Lee, H., Xu, Y., Chen, D., Firat, O., Huang,
+                                                                     training gopher. CoRR, abs/2112.11446, 2021.
+  Y., Krikun, M., Shazeer, N., and Chen, Z. GShard: Scal-
+  ing giant models with conditional computation and auto-          Rajbhandari, S., Li, C., Yao, Z., Zhang, M., Aminabadi,
+  matic sharding. In International Conference on Learning            R. Y., Awan, A. A., Rasley, J., and He, Y. DeepSpeed-
+  Representations, 2021. URL https://openreview.                     MoE: Advancing mixture-of-experts inference and train-
+  net/forum?id=qrwe7XHTmYb.                                          ing to power next-generation AI scale. In Chaudhuri, K.,
+                                                                     Jegelka, S., Song, L., Szepesvari, C., Niu, G., and Sabato,
+Levy, R. Expectation-based syntactic comprehension. Cog-
+                                                                     S. (eds.), Proceedings of the 39th International Confer-
+  nition, 106(3):1126–1177, 2008. doi: 10.1016/j.cognition.
+                                                                     ence on Machine Learning, volume 162 of Proceedings
+  2007.05.006.
+                                                                     of Machine Learning Research, pp. 18332–18346. PMLR,
+Lewis, M., Bhosale, S., Dettmers, T., Goyal, N., and Zettle-         17–23 Jul 2022. URL https://proceedings.mlr.
+  moyer, L. Base layers: Simplifying training of large,              press/v162/rajbhandari22a.html.
+  sparse models. In International Conference on Machine
+  Learning, 2021.                                                  Roller, S., Sukhbaatar, S., szlam, a., and Weston, J.
+                                                                     Hash layers for large sparse models. In Ranzato, M.,
+Liu, W., Zhou, P., Wang, Z., Zhao, Z., Deng, H., and Ju,             Beygelzimer, A., Dauphin, Y., Liang, P., and Vaughan,
+  Q. FastBERT: a self-distilling BERT with adaptive in-              J. W. (eds.), Advances in Neural Information Processing
+  ference time. In Proceedings of the 58th Annual Meet-              Systems, volume 34, pp. 17555–17566. Curran Asso-
+  ing of the Association for Computational Linguistics, pp.          ciates, Inc., 2021. URL https://proceedings.
+                                           Learning to Skip for Language Modeling
+
+  neurips.cc/paper/2021/file/                               Wang, X., Luo, Y., Crankshaw, D., Tumanov, A., and Gon-
+  92bf5e6240737e0326ea59846a83e076-Paper.                     zalez, J. E. IDK cascades: Fast deep learning by learning
+  pdf.                                                        not to overthink. CoRR, abs/1706.00885, 2017. URL
+                                                              http://arxiv.org/abs/1706.00885.
+Schuster, T., Fisch, A., Gupta, J. P., Dehghani, M., Bahri,
+  D., Tran, V. Q., Tay, Y., and Metzler, D. Confident       Wang, X., Yu, F., Dou, Z., Darrell, T., and Gonzalez, J. E.
+  adaptive language modeling. CoRR, abs/2207.07061,           Skipnet: Learning dynamic routing in convolutional net-
+  2022. doi: 10.48550/arXiv.2207.07061. URL https:            works. In Ferrari, V., Hebert, M., Sminchisescu, C., and
+  //doi.org/10.48550/arXiv.2207.07061.                        Weiss, Y. (eds.), Computer Vision - ECCV 2018 - 15th Eu-
+                                                              ropean Conference, Munich, Germany, September 8-14,
+Schwartz, R., Stanovsky, G., Swayamdipta, S., Dodge, J.,      2018, Proceedings, Part XIII, volume 11217 of Lecture
+  and Smith, N. A. The right tool for the job: Match-         Notes in Computer Science, pp. 420–436. Springer, 2018.
+  ing model and instance complexities. In Proceed-            doi: 10.1007/978-3-030-01261-8\ 25. URL https://
+  ings of the 58th Annual Meeting of the Association          doi.org/10.1007/978-3-030-01261-8_25.
+  for Computational Linguistics, pp. 6640–6651, Online,
+  July 2020. Association for Computational Linguistics.     Xin, J., Tang, R., Lee, J., Yu, Y., and Lin, J. Deebert:
+  doi: 10.18653/v1/2020.acl-main.593. URL https:              Dynamic early exiting for accelerating bert inference.
+  //aclanthology.org/2020.acl-main.593.                       arXiv preprint arXiv:2004.12993, 2020.
+
+Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le,         Zeng, Y., Dai, T., Chen, B., Xia, S.-T., and Lu, J.
+  Q. V., Hinton, G. E., and Dean, J. Outrageously large            Correlation-based structural dropout for convolutional
+  neural networks: The sparsely-gated mixture-of-experts           neural networks. Pattern Recognition, 120:108117, 2021.
+  layer. In 5th International Conference on Learning Rep-
+  resentations, ICLR 2017, Toulon, France, April 24-26,          Zhou, Y., Lei, T., Liu, H., Du, N., Huang, Y., Zhao, V.,
+  2017, Conference Track Proceedings. OpenReview.net,              Dai, A., Chen, Z., Le, Q., and Laudon, J. Mixture-
+  2017. URL https://openreview.net/forum?                          of-experts with expert choice routing. arXiv preprint
+  id=B1ckMDqlg.                                                    arXiv:2202.09368, 2022.
+
+Shoeybi, M., Patwary, M., Puri, R., LeGresley, P., Casper, J.,
+  and Catanzaro, B. Megatron-lm: Training multi-billion
+  parameter language models using gpu model parallelism.
+  arXiv preprint arXiv:1909.08053, 2019.
+
+Srivastava, R. K., Greff, K., and Schmidhuber, J. Highway
+  networks. arXiv preprint arXiv:1505.00387, 2015.
+
+Stanovich, K. E. and West, R. F. Individual differences in
+  reasoning: Implications for the rationality debate? Be-
+  havioral and Brain Sciences, 23(5):645–665, 2000. doi:
+  10.1017/S0140525X00003435.
+
+Tompson, J., Goroshin, R., Jain, A., LeCun, Y., and Bre-
+  gler, C. Efficient object localization using convolutional
+  networks. In Proceedings of the IEEE conference on
+  computer vision and pattern recognition, pp. 648–656,
+  2015.
+
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J.,
+  Jones, L., Gomez, A. N., Kaiser, L. u., and Polosukhin,
+  I. Attention is all you need. In Guyon, I., Luxburg,
+  U. V., Bengio, S., Wallach, H., Fergus, R., Vish-
+  wanathan, S., and Garnett, R. (eds.), Advances in Neural
+  Information Processing Systems, volume 30. Curran As-
+  sociates, Inc., 2017. URL https://proceedings.
+  neurips.cc/paper/2017/file/
+  3f5ee243547dee91fbd053c1c4a845aa-Paper.
+  pdf.
+

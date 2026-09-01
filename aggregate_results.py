@@ -21,8 +21,14 @@ COLUMNS = [
     "pearson_nll_depth", "spearman_nll_depth", "checkpoint", "source",
     "paper_reproduction", "n_layers", "effective_target_depth", "learning_rate",
     "estimated_executed_block_flops_per_sequence", "dense_block_flops_per_sequence",
-    "grpo_variant", "depth_budgets", "exploration_epsilon", "clip_fraction",
+    "grpo_variant", "depth_budgets", "exploration_epsilon", "ppo_clip_epsilon",
+    "clip_fraction",
     "mean_probability_ratio",
+    "mor_reproduction", "experiment_family", "recursion_steps",
+    "recursion_block_layers", "mor_capacity_factors", "mor_aux_loss_coefficient",
+    "recursion_utilization", "recursion_soft_utilization",
+    "mean_recursions_per_token", "mor_router_accuracy", "mor_aux_loss",
+    "estimated_flops_vs_full_dense",
 ]
 GROUP_KEYS = ["model", "router_type", "training_method", "target_density", "lambda_density", "lambda_grpo"]
 METRICS = [

@@ -4,6 +4,7 @@ import torch
 
 from config import ModelConfig
 from model import TransformerBlock, apply_block_gate, build_model
+from utils import estimate_dense_block_flops, estimate_mor_flops
 
 
 def tiny_config(**overrides) -> ModelConfig:
@@ -135,3 +136,76 @@ def test_sparse_greedy_block_matches_dense_masked_semantics() -> None:
     dense_masked = apply_block_gate(x, block(x), active.unsqueeze(-1).float())
     sparse = block.forward_selected(x, active)
     torch.testing.assert_close(sparse, dense_masked, rtol=1e-5, atol=1e-6)
+
+
+def test_mor_middle_cycle_has_four_unique_blocks_and_eight_effective_layers() -> None:
+    config = tiny_config(
+        model_type="mor",
+        router_type="linear",
+        n_layers=8,
+        recursion_steps=3,
+        recursion_block_layers=2,
+        mor_reproduction=True,
+    )
+    model = build_model(config)
+    assert len(model.blocks) == 4
+    output = model(
+        torch.randint(0, config.vocab_size, (2, config.context_length)),
+        routing_mode="topk",
+    )
+    assert output.hard_gates.shape == (2, config.context_length, 8)
+    assert output.actions.shape == (2, config.context_length, 3)
+    torch.testing.assert_close(
+        output.recursion_utilization,
+        torch.tensor([1.0, 5 / 8, 2 / 8]),
+    )
+    assert torch.isfinite(output.mor_aux_loss)
+
+
+def test_mor_budget_anchor_and_minimum_recursion_are_exact() -> None:
+    config = tiny_config(
+        model_type="mor",
+        router_type="linear",
+        n_layers=8,
+        recursion_steps=3,
+        recursion_block_layers=2,
+    )
+    model = build_model(config).eval()
+    output = model(
+        torch.randint(0, config.vocab_size, (2, config.context_length)),
+        routing_mode="budget",
+        target_recursions=torch.tensor([1, 3]),
+        exploration_epsilon=torch.ones(2),
+    )
+    torch.testing.assert_close(
+        output.hard_gates.sum(dim=-1),
+        torch.tensor([[4.0], [8.0]]).expand(2, config.context_length),
+    )
+    assert torch.isfinite(output.behavior_log_probs).all()
+
+
+def test_mor_flops_equal_dense_when_all_effective_layers_execute() -> None:
+    config = tiny_config(
+        model_type="mor",
+        router_type="linear",
+        n_layers=8,
+        recursion_steps=3,
+        recursion_block_layers=2,
+    )
+    mor = estimate_mor_flops(config, config.context_length, [1.0, 1.0, 1.0])
+    dense = estimate_dense_block_flops(config, config.context_length)
+    # MoR adds only its lightweight scalar routers beyond the dense blocks.
+    assert dense < mor < dense * 1.01
+
+
+def test_recursion_wise_attention_saves_more_than_linear_depth_fraction() -> None:
+    config = tiny_config(
+        model_type="mor",
+        router_type="linear",
+        n_layers=8,
+        recursion_steps=3,
+        recursion_block_layers=2,
+    )
+    routed = estimate_mor_flops(config, config.context_length, [1.0, 0.625, 0.25])
+    full = estimate_dense_block_flops(config, config.context_length)
+    assert routed < full

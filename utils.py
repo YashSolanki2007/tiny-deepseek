@@ -54,9 +54,12 @@ def routing_metrics(output: ModelOutput, n_layers: int) -> Dict[str, Any]:
     else:
         hard = output.hard_gates.float().mean(dim=(0, 1))
         soft = output.soft_gates.float().mean(dim=(0, 1))
-        entropy = output.routing_entropy.float().mean().item()
+        if output.routing_decision_mask is not None and bool(output.routing_decision_mask.any()):
+            entropy = output.routing_entropy.float()[output.routing_decision_mask].mean().item()
+        else:
+            entropy = output.routing_entropy.float().mean().item()
     density = hard.mean().item()
-    return {
+    metrics = {
         "mean_soft_gate": soft.mean().item(),
         "mean_hard_gate": density,
         "actual_density": density,
@@ -67,6 +70,21 @@ def routing_metrics(output: ModelOutput, n_layers: int) -> Dict[str, Any]:
         "layer_utilization": hard.detach().cpu().tolist(),
         "layer_soft_probability": soft.detach().cpu().tolist(),
     }
+    if output.recursion_utilization is not None:
+        metrics["recursion_utilization"] = (
+            output.recursion_utilization.detach().float().cpu().tolist()
+        )
+        metrics["recursion_soft_utilization"] = (
+            output.recursion_soft_utilization.detach().float().cpu().tolist()
+        )
+        metrics["mean_recursions_per_token"] = float(
+            output.recursion_utilization.detach().float().sum().item()
+        )
+        metrics["mor_router_accuracy"] = float(
+            output.mor_router_accuracy.detach().item()
+        )
+        metrics["mor_aux_loss"] = float(output.mor_aux_loss.detach().item())
+    return metrics
 
 
 def top1_accuracy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -104,6 +122,39 @@ def estimate_skiplayer_flops(
         config.n_layers
         * (key_value + active_query_output + active_attention + active_ffn + router)
     )
+
+
+def estimate_mor_flops(
+    config: ModelConfig,
+    seq_len: int,
+    recursion_utilization: Iterable[float],
+) -> float:
+    """MoR forward FLOPs with Middle-Cycle and recursion-wise KV caching.
+
+    Entry and exit layers process the full sequence. At each recursion, Q/K/V,
+    FFN, and output projections scale linearly with the active token fraction,
+    while attention matmuls scale quadratically because both query and KV
+    sequences are restricted to the selected tokens.
+    """
+    utilization = [float(value) for value in recursion_utilization]
+    if len(utilization) != config.recursion_steps:
+        raise ValueError("recursion utilization length must match recursion_steps")
+    d, ff, length = config.d_model, config.d_ff, float(seq_len)
+    full_layer = 8 * length * d * d + 4 * length * length * d + 4 * length * d * ff
+    total = 2 * full_layer
+    previous = 1.0
+    for active in utilization:
+        p = min(max(active, 0.0), previous)
+        projections = 8 * p * length * d * d
+        attention = 4 * (p * length) ** 2 * d
+        feed_forward = 4 * p * length * d * ff
+        total += config.recursion_block_layers * (
+            projections + attention + feed_forward
+        )
+        # One scalar linear router is evaluated for each candidate token.
+        total += 2 * previous * length * d
+        previous = p
+    return float(total)
 
 
 def write_json(path: str | Path, values: Dict[str, Any]) -> None:

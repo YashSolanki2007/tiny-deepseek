@@ -1,0 +1,78 @@
+                                                Learning to Skip for Language Modeling
+
+                           to                Best                    ness of the activating decisions, soft-approximations and RL-
+            ed            d e
+    a on            son                    us                        based implementations has been explored in the vision (Sri-
+                                ran                                  vastava et al., 2015; Wang et al., 2018) and NLP (Bapna
+                  one      al         u ph i                         et al., 2020) community. Our approach is closer to the sec-
+          non                 of                                     ond learning approach but differ in that SkipLayer does
+                                 San States          No   andy
+       Cup       now      m                                          not require the soft-approximation during the forward pass,
+        er                                     g                     giving computational savings not just in inference but also
+                 t      ie                                           during training. This difference is crucial since pretraining
+                         an           ara                            language models is often time consuming and costly.
+               ing        or              Kingdom
+                   Paris ve Sea flow              ll        little
+                                                           ar        Additionally, concurrent work such as CODA (Lei et al.,
+              Senate                                                 2023) and CoLT5 (Ainslie et al., 2023) have applied simi-
+                                                                     lar token selection method to activate Transformer layers.
+                                                                     However, these work only apply conditional activation in
+Figure 7. Bubble chart of the skipping behaviour of tokens during    the encoder layers of an encoder-decoder model such as T5.
+greedy decoding on TriviaQA dataset using our SkipLayer (12L,
+50%) model. Each dot represents a token, larger dot size means
+more layers are skipped. Black/Red texts show some tokens that
+                                                                     Mixture of Experts have recently been proposed to im-
+skip the most/least layers.                                          prove model efficiency (Shazeer et al., 2017; Gross et al.,
+                                                                     2017; Lepikhin et al., 2021; Fedus et al., 2021; Roller et al.,
+                                                                     2021; Du et al., 2022; Artetxe et al., 2021; Lewis et al., 2021;
+derstand what kind of tokens skip more layers than others            Zhou et al., 2022; Rajbhandari et al., 2022) by sparsely acti-
+during greedy decoding, we collected the skipping statistics         vating a subset of experts in a MoE layer.
+of the decoding results of 500 sampled questions in Trivi-           Our approach is orthogonal to MoE models in that an MoE
+aQA using our SkipLayer (12L, 50%) model. In Figure 7,               layer can be easily wrapped by the SkipLayer for additional
+we plotted the bubble chart of 300 frequently used tokens            efficiency. Moreover, SkipLayer can apply conditional com-
+in the decoding results according to their averaged number           putation to both the self-attention and the Feed-Forward
+of skipped layers (One token may have different skipping             (FFN) component of a Transformer layer, whereas MoE
+patterns under different contexts). Larger dots in the figure        models mainly focus on conditionally activating the FFN
+represents more layers are skipped. We can observe that              component in a MoE layer.
+tokens that skip the most are mainly functional words like
+“and”, “to”, “ed” or “ing”. These tokens can be easily in-
+                                                                     Structural Dropout (Tompson et al., 2015; Ghiasi et al.,
+ferred from the previous contexts and thus do not need much
+                                                                     2018; Dai et al., 2019; Fan et al., 2019; Zeng et al., 2021)
+computation to decode. While tokens that skip less are usu-
+                                                                     randomly drops a group of weights, e.g., a layer (Fan et al.,
+ally independent words like “No” or “Paris”. This indeed
+                                                                     2019), during training to achieve better generalization and
+shows that our SkipLayer model can successfully identify
+                                                                     robustness for pruning during inference. However, the
+such tokens and assign proper computation accordingly.
+                                                                     amount of computation during inference is still uniform
+                                                                     per example. In contrast, SkipLayer-based models learn the
+5. Related Work                                                      skipping patterns from the data which shows better perfor-
+                                                                     mance than the random skipping baseline, and potentially
+Conditional Computation (Bengio et al., 2013; 2015)
+                                                                     assign non-uniform amount of computation to each example
+is a paradigm where only a subset of model parameters can
+                                                                     during inference.
+be activated per input example. Early-exit is one kind of
+implementation for conditional computation where external
+classifiers equipped with confidence-based thresholding are          6. Conclusions
+used to exit early without going through the whole stack
+                                                                     We propose a new general method named SkipLayer for dy-
+of layers (Wang et al., 2017; Xin et al., 2020; Schwartz
+                                                                     namically skipping the execution of arbitrary layers based
+et al., 2020; Liu et al., 2020; Dabre et al., 2020; Elbayad
+                                                                     on the input context using a simple routing algorithm. This
+et al., 2020; Schuster et al., 2022). Unlike these approaches
+                                                                     method enables heterogeneous computation for tokens at dif-
+where the computation is activated for the bottom layers,
+                                                                     ferent complexity or importance so that more computation
+SkipLayer-based models technically allows each input to
+                                                                     resources can be used for improving the predictive quality
+explore 2L different compute paths for a model with L
+                                                                     of harder tokens. Our model demonstrates significant 1-shot
+stacked layers.
+                                                                     performance improvement across 24 NLP tasks compared
+An alternative technique is to enable the model to ‘learn’           to other competitive baselines with only a small extra cost
+how to activate its different sub-layers. Due to the discrete-       for inference.
+

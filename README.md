@@ -117,6 +117,42 @@ The density coefficient is zero during the first 10% of training, ramps from 10�
 
 ## GRPO router fine-tuning
 
+## Mixture-of-Recursions comparison
+
+The paper-aligned MoR implementation uses Middle-Cycle parameter sharing:
+one unique entry block, two shared middle blocks applied for three recursive
+steps, and one unique exit block. This gives eight effective layers from four
+stored Transformer blocks. Hierarchical expert-choice capacities are
+`1, 2/3, 1/3`; validation logs learned greedy routing separately from oracle
+top-k routing.
+
+Run the complete requested comparison—full dense, SkipLayer, SkipLayer + GRPO,
+MoR, and MoR + GRPO—with:
+
+```bash
+python run_mor_comparison.py
+```
+
+The default output locations are:
+
+```text
+experiments/mor_comparison_seed42/
+results/mor_comparison_seed42/
+```
+
+For a live, clearly grouped TensorBoard view:
+
+```bash
+tensorboard \
+  --logdir experiments/mor_comparison_seed42 \
+  --port 6006
+```
+
+Open `http://localhost:6006`. Supervised runs log `train`, `validation`, and,
+for MoR, `validation_oracle_topk`. GRPO runs additionally log reward, policy
+ratio/clipping, KL, entropy, achieved depth and FLOPs for every rollout budget,
+plus per-recursion utilization and router diagnostics.
+
 For the paper-faithful linear SkipLayer checkpoint, use the budget-guided,
 per-decision variant. It samples explicit 3/4/5/8-layer rollout groups from a
 recorded router/controller mixture, uses 8/8 as a quality anchor, freezes the

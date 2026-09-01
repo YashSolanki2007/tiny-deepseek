@@ -26,6 +26,11 @@ class ModelOutput:
     behavior_log_probs: Optional[torch.Tensor] = None
     routing_entropy: Optional[torch.Tensor] = None
     route_logits: Optional[torch.Tensor] = None
+    routing_decision_mask: Optional[torch.Tensor] = None
+    mor_aux_loss: Optional[torch.Tensor] = None
+    mor_router_accuracy: Optional[torch.Tensor] = None
+    recursion_utilization: Optional[torch.Tensor] = None
+    recursion_soft_utilization: Optional[torch.Tensor] = None
 
 
 class CausalSelfAttention(nn.Module):
@@ -300,11 +305,7 @@ class SparseDepthTransformer(TransformerBase):
                     logits, mode, self.config.gumbel_temperature, supplied
                 )
                 behavior_log_prob = log_prob
-            if (
-                self.config.sparse_inference
-                and not self.training
-                and mode == "greedy"
-            ):
+            if self.config.sparse_inference and not self.training and mode == "greedy":
                 x = block.forward_selected(x, chosen.bool())
             else:
                 candidate = block(x)
@@ -329,8 +330,243 @@ class SparseDepthTransformer(TransformerBase):
         )
 
 
+class MixtureOfRecursionsTransformer(TransformerBase):
+    """Tiny-Shakespeare analogue of expert-choice Middle-Cycle MoR.
+
+    The effective stack is ``entry + shared_block * recursions + exit``.
+    Training uses hierarchical expert-choice top-k routing and the paper's
+    auxiliary BCE. Greedy evaluation uses the learned 0.5 threshold, avoiding
+    validation-time top-k information leakage.
+    """
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__(config)
+        initialized = list(self.blocks)
+        unique_count = config.recursion_block_layers + 2
+        self.blocks = nn.ModuleList(initialized[:unique_count])
+        self.recursion_routers = nn.ModuleList(
+            [nn.Linear(config.d_model, 1) for _ in range(config.recursion_steps)]
+        )
+        self.recursion_routers.apply(self._init_weights)
+
+    @property
+    def router(self) -> nn.ModuleList:
+        return self.recursion_routers
+
+    def router_parameters(self):
+        return self.recursion_routers.parameters()
+
+    def _capacity(self, recursion_index: int) -> float:
+        target = self.config.mor_capacity_factors[recursion_index]
+        if not self.training or self.config.mor_capacity_warmup_steps <= 0:
+            return target
+        # Kept for compatibility with the authors' cosine capacity warmup.
+        # The selected paper configuration uses zero warmup steps.
+        return target
+
+    @staticmethod
+    def _selected_log_probability(
+        binary_logits: torch.Tensor, selected: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        log_probabilities = F.log_softmax(binary_logits, dim=-1)
+        probabilities = log_probabilities.exp()
+        log_probability = torch.where(
+            selected, log_probabilities[..., 1], log_probabilities[..., 0]
+        )
+        entropy = -(probabilities * log_probabilities).sum(dim=-1)
+        return probabilities[..., 1], log_probability, entropy
+
+    def _apply_recursion_block(
+        self, x: torch.Tensor, selected: torch.Tensor, gate_weight: torch.Tensor
+    ) -> torch.Tensor:
+        output = x.clone()
+        shared_blocks = self.blocks[1:-1]
+        for batch_index in range(x.shape[0]):
+            indices = selected[batch_index].nonzero(as_tuple=False).flatten()
+            if indices.numel() == 0:
+                continue
+            initial = x[batch_index : batch_index + 1, indices]
+            transformed = initial
+            for block in shared_blocks:
+                transformed = block(transformed)
+            weight = gate_weight[batch_index, indices].view(1, -1, 1)
+            updated = initial + weight * (transformed - initial)
+            output[batch_index, indices] = updated[0]
+        return output
+
+    def forward(
+        self,
+        token_ids: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        routing_mode: Optional[str] = None,
+        actions: Optional[torch.Tensor] = None,
+        router_override: Optional[nn.Module] = None,
+        target_recursions: Optional[torch.Tensor] = None,
+        exploration_epsilon: float | torch.Tensor = 0.0,
+    ) -> ModelOutput:
+        mode = routing_mode or ("topk" if self.training else "greedy")
+        if mode == "gumbel":
+            mode = "topk"
+        routers = router_override if router_override is not None else self.recursion_routers
+        x = self.blocks[0](self.embed(token_ids))
+        batch, seq_len = token_ids.shape
+        previous_selected = torch.ones(
+            batch, seq_len, device=token_ids.device, dtype=torch.bool
+        )
+        soft_by_recursion, hard_by_recursion = [], []
+        actions_by_recursion, log_probs, behavior_log_probs = [], [], []
+        entropies, logits_by_recursion, decision_masks = [], [], []
+        auxiliary_losses, accuracies = [], []
+
+        if mode == "budget":
+            if target_recursions is None or target_recursions.shape != (batch,):
+                raise ValueError("budget MoR routing requires target_recursions shaped [batch]")
+            target_recursions = target_recursions.to(token_ids.device)
+            if bool(
+                ((target_recursions < 1) | (target_recursions > self.config.recursion_steps)).any()
+            ):
+                raise ValueError("target_recursions must lie in [1, recursion_steps]")
+            epsilon = torch.as_tensor(
+                exploration_epsilon, device=token_ids.device, dtype=torch.float32
+            )
+            if epsilon.ndim == 0:
+                epsilon = epsilon.expand(batch)
+            if epsilon.shape != (batch,) or bool(((epsilon < 0) | (epsilon > 1)).any()):
+                raise ValueError("exploration_epsilon must be scalar or a [batch] value in [0,1]")
+
+        for recursion_index in range(self.config.recursion_steps):
+            raw_logits = routers[recursion_index](x).squeeze(-1)
+            binary_logits = torch.stack((torch.zeros_like(raw_logits), raw_logits), dim=-1)
+            policy_execute = raw_logits.sigmoid()
+            decision_mask = previous_selected.clone()
+            supplied = actions[..., recursion_index].bool() if actions is not None else None
+
+            if supplied is not None:
+                selected = supplied & previous_selected
+                behavior_log_probability = None
+            elif recursion_index == 0:
+                selected = previous_selected
+                behavior_log_probability = torch.zeros_like(raw_logits)
+                decision_mask = torch.zeros_like(previous_selected)
+            elif mode == "topk":
+                capacity = self._capacity(recursion_index)
+                count = max(1, int(capacity * seq_len))
+                masked_scores = raw_logits.masked_fill(~previous_selected, float("-inf"))
+                selected = torch.zeros_like(previous_selected)
+                for batch_index in range(batch):
+                    available = int(previous_selected[batch_index].sum().item())
+                    take = min(count, available)
+                    if take:
+                        indices = masked_scores[batch_index].topk(take, sorted=False).indices
+                        selected[batch_index, indices] = True
+                behavior_log_probability = None
+            elif mode == "greedy":
+                selected = policy_execute.ge(0.5) & previous_selected
+                behavior_log_probability = None
+            elif mode == "sample":
+                selected = torch.rand_like(policy_execute).lt(policy_execute) & previous_selected
+                behavior_log_probability = None
+            elif mode == "budget":
+                controller_execute = target_recursions[:, None].gt(recursion_index)
+                mixed = (
+                    (1.0 - epsilon[:, None]) * policy_execute
+                    + epsilon[:, None] * controller_execute.float()
+                )
+                behavior_execute = mixed.clamp(
+                    torch.finfo(raw_logits.dtype).eps,
+                    1.0 - torch.finfo(raw_logits.dtype).eps,
+                )
+                behavior_execute = torch.where(
+                    epsilon[:, None].eq(1.0),
+                    controller_execute.float().expand_as(behavior_execute),
+                    behavior_execute,
+                )
+                selected = torch.rand_like(behavior_execute).lt(behavior_execute)
+                selected = selected & previous_selected
+                behavior_log_probability = torch.where(
+                    selected, behavior_execute.log(), (-behavior_execute).log1p()
+                )
+            else:
+                raise ValueError(f"Unknown MoR routing mode: {mode}")
+
+            soft, log_probability, entropy = self._selected_log_probability(
+                binary_logits, selected
+            )
+            if behavior_log_probability is None:
+                behavior_log_probability = log_probability
+
+            capacity = self._capacity(recursion_index)
+            target_count = max(1, int(capacity * seq_len))
+            oracle_target = torch.zeros_like(previous_selected)
+            masked_scores = raw_logits.masked_fill(~previous_selected, float("-inf"))
+            for batch_index in range(batch):
+                available = int(previous_selected[batch_index].sum().item())
+                take = min(target_count, available)
+                if take:
+                    indices = masked_scores[batch_index].topk(take, sorted=False).indices
+                    oracle_target[batch_index, indices] = True
+            candidates = previous_selected
+            if bool(candidates.any()):
+                auxiliary_losses.append(
+                    F.binary_cross_entropy_with_logits(
+                        raw_logits[candidates], oracle_target[candidates].float()
+                    )
+                )
+                accuracies.append(
+                    policy_execute.ge(0.5)[candidates]
+                    .eq(oracle_target[candidates])
+                    .float()
+                    .mean()
+                )
+            else:
+                auxiliary_losses.append(raw_logits.sum() * 0.0)
+                accuracies.append(raw_logits.new_ones(()))
+
+            gate_weight = self.config.mor_router_alpha * policy_execute
+            x = self._apply_recursion_block(x, selected, gate_weight)
+            previous_selected = selected
+            soft_by_recursion.append(soft * candidates.float())
+            hard_by_recursion.append(selected.float())
+            actions_by_recursion.append(selected.long())
+            log_probs.append(log_probability)
+            behavior_log_probs.append(behavior_log_probability)
+            entropies.append(entropy)
+            logits_by_recursion.append(binary_logits)
+            decision_masks.append(decision_mask)
+
+        x = self.blocks[-1](x)
+        ones = torch.ones_like(hard_by_recursion[0])
+        hard_layers = [ones]
+        soft_layers = [ones]
+        for soft, hard in zip(soft_by_recursion, hard_by_recursion):
+            hard_layers.extend([hard] * self.config.recursion_block_layers)
+            soft_layers.extend([soft] * self.config.recursion_block_layers)
+        hard_layers.append(ones)
+        soft_layers.append(ones)
+        recursion_hard = torch.stack(hard_by_recursion, dim=-1)
+        recursion_soft = torch.stack(soft_by_recursion, dim=-1)
+        return self.finish(
+            x,
+            targets,
+            soft_gates=torch.stack(soft_layers, dim=-1),
+            hard_gates=torch.stack(hard_layers, dim=-1),
+            actions=torch.stack(actions_by_recursion, dim=-1),
+            action_log_probs=torch.stack(log_probs, dim=-1),
+            behavior_log_probs=torch.stack(behavior_log_probs, dim=-1),
+            routing_entropy=torch.stack(entropies, dim=-1),
+            route_logits=torch.stack(logits_by_recursion, dim=2),
+            routing_decision_mask=torch.stack(decision_masks, dim=-1),
+            mor_aux_loss=torch.stack(auxiliary_losses).sum(),
+            mor_router_accuracy=torch.stack(accuracies).mean(),
+            recursion_utilization=recursion_hard.float().mean(dim=(0, 1)),
+            recursion_soft_utilization=recursion_soft.float().mean(dim=(0, 1)),
+        )
 DynamicDepthTransformer = SparseDepthTransformer
 
 
 def build_model(config: ModelConfig) -> TransformerBase:
-    return DenseTransformer(config) if config.model_type == "dense" else SparseDepthTransformer(config)
+    if config.model_type == "dense":
+        return DenseTransformer(config)
+    if config.model_type == "mor":
+        return MixtureOfRecursionsTransformer(config)
+    return SparseDepthTransformer(config)

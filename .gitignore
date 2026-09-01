@@ -1,0 +1,10 @@
+__pycache__/
+.pytest_cache/
+.venv/
+data/input.txt
+runs/
+checkpoints/
+*.pt
+*.png
+results.csv
+benchmark.csv

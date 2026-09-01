@@ -1,0 +1,214 @@
+{
+  "model": "sparse",
+  "router_type": "linear",
+  "training_method": "supervised",
+  "seed": 42,
+  "target_density": 0.5,
+  "lambda_density": 0.1,
+  "paper_reproduction": true,
+  "density_reduction": "sum",
+  "optimizer_name": "adafactor",
+  "parameter_count": 2665856,
+  "active_parameter_estimate": 1350454.5359375,
+  "training_time_sec": 191.6828885418363,
+  "seconds_per_step": 0.12113739968789741,
+  "tokens_per_sec": 21368.626230327365,
+  "dense_block_flops_per_sequence": 738197504.0,
+  "estimated_executed_block_flops_per_sequence": 404200448.0,
+  "checkpoint": "experiments/paper_core_exact_1000/paper_skip_L08_P050_Eff04_seed42/checkpoints/best_val_loss.pt",
+  "val_loss": 3.019400177001953,
+  "val_accuracy": 0.18859375,
+  "density_loss": 0.19197671055793764,
+  "mean_soft_gate": 0.5605633473396301,
+  "mean_hard_gate": 0.5812176513671875,
+  "layers_per_token": 4.6497412109375,
+  "compute_fraction": 0.5812176513671875,
+  "skip_fraction": 0.4187823486328125,
+  "routing_entropy": 0.4797735297679901,
+  "val_perplexity": 20.479004221700777,
+  "validation_time_sec": 37.931863208301365,
+  "layer_utilization": [
+    0.5750195384025574,
+    0.43852052092552185,
+    0.4835790991783142,
+    0.4901660084724426,
+    0.7365967035293579,
+    0.4341357350349426,
+    0.7305957078933716,
+    0.7611279487609863
+  ],
+  "layer_soft_probability": [
+    0.5716239213943481,
+    0.49712979793548584,
+    0.5006487369537354,
+    0.49739235639572144,
+    0.5594556331634521,
+    0.4750503897666931,
+    0.6564284563064575,
+    0.7267775535583496
+  ],
+  "generation_tokens_per_sec": 25.485301735592124,
+  "generation_ms_per_token": 39.238303331658244,
+  "generation_compute_fraction": 0.5699999928474426,
+  "pearson_nll_depth": -0.05637802730929143,
+  "spearman_nll_depth": -0.06758879240574395,
+  "difficulty_quantile_depth": [
+    4.696753025054932,
+    4.846289157867432,
+    4.643798828125,
+    4.488427639007568,
+    4.5714111328125
+  ],
+  "difficulty_quantile_labels": [
+    "0\u201320%",
+    "20\u201340%",
+    "40\u201360%",
+    "60\u201380%",
+    "80\u2013100%"
+  ],
+  "tokens_analyzed": 204800,
+  "most_skipped_tokens": [
+    {
+      "token_id": 0,
+      "token": "\n",
+      "count": 8278,
+      "average_skipped_layers": 5.622130949504712,
+      "average_executed_layers": 2.3778690504952884
+    },
+    {
+      "token_id": 33,
+      "token": "U",
+      "count": 490,
+      "average_skipped_layers": 5.261224489795918,
+      "average_executed_layers": 2.738775510204082
+    },
+    {
+      "token_id": 17,
+      "token": "E",
+      "count": 842,
+      "average_skipped_layers": 5.102137767220903,
+      "average_executed_layers": 2.8978622327790973
+    },
+    {
+      "token_id": 38,
+      "token": "Z",
+      "count": 69,
+      "average_skipped_layers": 5.086956521739131,
+      "average_executed_layers": 2.913043478260869
+    },
+    {
+      "token_id": 22,
+      "token": "J",
+      "count": 12,
+      "average_skipped_layers": 4.75,
+      "average_executed_layers": 3.25
+    },
+    {
+      "token_id": 23,
+      "token": "K",
+      "count": 314,
+      "average_skipped_layers": 4.630573248407643,
+      "average_executed_layers": 3.369426751592357
+    },
+    {
+      "token_id": 24,
+      "token": "L",
+      "count": 503,
+      "average_skipped_layers": 4.5884691848906565,
+      "average_executed_layers": 3.4115308151093435
+    },
+    {
+      "token_id": 11,
+      "token": ";",
+      "count": 687,
+      "average_skipped_layers": 4.5196506550218345,
+      "average_executed_layers": 3.4803493449781655
+    },
+    {
+      "token_id": 29,
+      "token": "Q",
+      "count": 2,
+      "average_skipped_layers": 4.5,
+      "average_executed_layers": 3.5
+    },
+    {
+      "token_id": 13,
+      "token": "A",
+      "count": 2157,
+      "average_skipped_layers": 4.456652758460825,
+      "average_executed_layers": 3.543347241539175
+    }
+  ],
+  "least_skipped_tokens": [
+    {
+      "token_id": 51,
+      "token": "m",
+      "count": 4138,
+      "average_skipped_layers": 1.6616723054615756,
+      "average_executed_layers": 6.338327694538425
+    },
+    {
+      "token_id": 47,
+      "token": "i",
+      "count": 8267,
+      "average_skipped_layers": 2.2551106810209265,
+      "average_executed_layers": 5.744889318979073
+    },
+    {
+      "token_id": 60,
+      "token": "v",
+      "count": 1253,
+      "average_skipped_layers": 2.3320031923383877,
+      "average_executed_layers": 5.667996807661613
+    },
+    {
+      "token_id": 56,
+      "token": "r",
+      "count": 8368,
+      "average_skipped_layers": 2.4116873804971317,
+      "average_executed_layers": 5.588312619502869
+    },
+    {
+      "token_id": 61,
+      "token": "w",
+      "count": 3427,
+      "average_skipped_layers": 2.422818791946309,
+      "average_executed_layers": 5.577181208053691
+    },
+    {
+      "token_id": 59,
+      "token": "u",
+      "count": 4583,
+      "average_skipped_layers": 2.4935631682304167,
+      "average_executed_layers": 5.506436831769584
+    },
+    {
+      "token_id": 50,
+      "token": "l",
+      "count": 5743,
+      "average_skipped_layers": 2.5209820651227584,
+      "average_executed_layers": 5.479017934877241
+    },
+    {
+      "token_id": 55,
+      "token": "q",
+      "count": 69,
+      "average_skipped_layers": 2.652173913043478,
+      "average_executed_layers": 5.3478260869565215
+    },
+    {
+      "token_id": 46,
+      "token": "h",
+      "count": 9196,
+      "average_skipped_layers": 2.824380165289256,
+      "average_executed_layers": 5.175619834710744
+    },
+    {
+      "token_id": 48,
+      "token": "j",
+      "count": 80,
+      "average_skipped_layers": 2.825,
+      "average_executed_layers": 5.175
+    }
+  ]
+}

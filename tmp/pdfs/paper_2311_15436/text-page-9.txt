@@ -1,0 +1,64 @@
+                                          Learning to Skip for Language Modeling
+
+References                                                        Lim, H., Zoph, B., Spiridonov, A., Sepassi, R., Do-
+                                                                  han, D., Agrawal, S., Omernick, M., Dai, A. M., Pil-
+Ainslie, J., Lei, T., de Jong, M., Ontañón, S., Brahma, S.,
+                                                                  lai, T. S., Pellat, M., Lewkowycz, A., Moreira, E.,
+  Zemlyanskiy, Y., Uthus, D., Guo, M., Lee-Thorp, J., Tay,
+                                                                  Child, R., Polozov, O., Lee, K., Zhou, Z., Wang, X.,
+  Y., et al. Colt5: Faster long-range transformers with
+                                                                  Saeta, B., Diaz, M., Firat, O., Catasta, M., Wei, J.,
+  conditional computation. In Proceedings of the 2023
+                                                                  Meier-Hellstern, K., Eck, D., Dean, J., Petrov, S., and
+  Conference on Empirical Methods in Natural Language
+                                                                  Fiedel, N. Palm: Scaling language modeling with path-
+  Processing (EMNLP), 2023.
+                                                                  ways. 2022. doi: 10.48550/ARXIV.2204.02311. URL
+Artetxe, M., Bhosale, S., Goyal, N., Mihaylov, T., Ott, M.,       https://arxiv.org/abs/2204.02311.
+  Shleifer, S., Lin, X. V., Du, J., Iyer, S., Pasunuru, R.,
+  Anantharaman, G., Li, X., Chen, S., Akin, H., Baines, M.,     Dabre, R., Rubino, R., and Fujita, A. Balancing cost and
+  Martin, L., Zhou, X., Koura, P. S., O’Horo, B., Wang, J.,       benefit with tied-multi transformers. In Birch, A., Finch,
+  Zettlemoyer, L., Diab, M., Kozareva, Z., and Stoyanov,          A. M., Hayashi, H., Heafield, K., Junczys-Dowmunt, M.,
+  V. Efficient large scale language modeling with mixtures        Konstas, I., Li, X., Neubig, G., and Oda, Y. (eds.), Pro-
+  of experts. 2021. URL https://arxiv.org/abs/                    ceedings of the Fourth Workshop on Neural Generation
+  2112.10684.                                                     and Translation, NGT@ACL 2020, Online, July 5-10,
+                                                                  2020, pp. 24–34. Association for Computational Linguis-
+Bapna, A., Arivazhagan, N., and Firat, O. Controlling             tics, 2020. doi: 10.18653/v1/2020.ngt-1.3. URL https:
+  computation versus quality for neural sequence models,         //doi.org/10.18653/v1/2020.ngt-1.3.
+  2020.
+                                                                Dai, Z., Chen, M., Gu, X., Zhu, S., and Tan, P. Batch drop-
+Bengio, E., Bacon, P., Pineau, J., and Precup, D. Conditional     block network for person re-identification and beyond. In
+  computation in neural networks for faster models. CoRR,         Proceedings of the IEEE/CVF international conference
+  abs/1511.06297, 2015. URL http://arxiv.org/                     on computer vision, pp. 3691–3701, 2019.
+  abs/1511.06297.
+Bengio, Y., Léonard, N., and Courville, A. C. Estimating       Du, N., Huang, Y., Dai, A. M., Tong, S., Lepikhin, D., Xu,
+  or propagating gradients through stochastic neurons for        Y., Krikun, M., Zhou, Y., Yu, A. W., Firat, O., Zoph, B.,
+  conditional computation. CoRR, abs/1308.3432, 2013.             Fedus, L., Bosma, M. P., Zhou, Z., Wang, T., Wang, E.,
+  URL http://arxiv.org/abs/1308.3432.                            Webster, K., Pellat, M., Robinson, K., Meier-Hellstern,
+                                                                  K., Duke, T., Dixon, L., Zhang, K., Le, Q., Wu, Y., Chen,
+Brown, T., Mann, B., Ryder, N., Subbiah, M., Kaplan,              Z., and Cui, C. GLaM: Efficient scaling of language mod-
+  J. D., Dhariwal, P., Neelakantan, A., Shyam, P., Sastry,        els with mixture-of-experts. In Proceedings of the 39th
+  G., Askell, A., Agarwal, S., Herbert-Voss, A., Krueger,         International Conference on Machine Learning, volume
+  G., Henighan, T., Child, R., Ramesh, A., Ziegler, D.,          162 of Proceedings of Machine Learning Research, pp.
+  Wu, J., Winter, C., Hesse, C., Chen, M., Sigler, E.,            5547–5569. PMLR, 17–23 Jul 2022. URL https://
+  Litwin, M., Gray, S., Chess, B., Clark, J., Berner, C.,         proceedings.mlr.press/v162/du22c.html.
+  McCandlish, S., Radford, A., Sutskever, I., and Amodei,
+  D. Language models are few-shot learners. In Larochelle, Elbayad, M., Gu, J., Grave, E., and Auli, M. Depth-adaptive
+  H., Ranzato, M., Hadsell, R., Balcan, M. F., and Lin,      transformer. In 8th International Conference on Learn-
+  H. (eds.), Advances in Neural Information Processing       ing Representations, ICLR 2020, Addis Ababa, Ethiopia,
+  Systems, volume 33, pp. 1877–1901. Curran Asso-            April 26-30, 2020. OpenReview.net, 2020. URL https:
+  ciates, Inc., 2020. URL https://proceedings.               //openreview.net/forum?id=SJg7KhVKPH.
+  neurips.cc/paper/2020/file/
+  1457c0d6bfcb4967418bfb8ac142f64a-Paper. Fan, A., Grave, E., and Joulin, A. Reducing transformer
+  pdf.                                                       depth on demand with structured dropout. arXiv preprint
+                                                             arXiv:1909.11556, 2019.
+Chowdhery, A., Narang, S., Devlin, J., Bosma, M., Mishra,
+  G., Roberts, A., Barham, P., Chung, H. W., Sutton,       Fedus, W., Zoph, B., and Shazeer, N. Switch transform-
+  C., Gehrmann, S., Schuh, P., Shi, K., Tsvyashchenko,       ers: Scaling to trillion parameter models with simple and
+  S., Maynez, J., Rao, A., Barnes, P., Tay, Y., Shazeer,     efficient sparsity. CoRR, abs/2101.03961, 2021. URL
+  N., Prabhakaran, V., Reif, E., Du, N., Hutchinson, B.,     https://arxiv.org/abs/2101.03961.
+  Pope, R., Bradbury, J., Austin, J., Isard, M., Gur-Ari,
+  G., Yin, P., Duke, T., Levskaya, A., Ghemawat, S.,       Ghiasi, G., Lin, T.-Y., and Le, Q. V. Dropblock: A regular-
+  Dev, S., Michalewski, H., Garcia, X., Misra, V., Robin-    ization method for convolutional networks. Advances in
+  son, K., Fedus, L., Zhou, D., Ippolito, D., Luan, D.,      neural information processing systems, 31, 2018.
+

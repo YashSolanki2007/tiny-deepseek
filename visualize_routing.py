@@ -18,8 +18,8 @@ def display_character(character: str) -> str:
 
 @torch.inference_mode()
 def save_routing_heatmap(model, stoi, text: str, mode: str, output_path: str | Path) -> Path:
-    if model.config.model_type != "sparse":
-        raise ValueError("Routing visualization requires a sparse checkpoint")
+    if model.config.model_type not in {"sparse", "mor"}:
+        raise ValueError("Routing visualization requires a routed checkpoint")
     unknown = sorted(set(text) - stoi.keys())
     if unknown:
         raise ValueError(f"Text contains unknown characters: {unknown!r}")

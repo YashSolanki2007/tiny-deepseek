@@ -27,3 +27,27 @@ def test_paper_runs_generate_paper_specific_report(tmp_path) -> None:
     assert "0.1\\sum_l" in report
     assert "There is no density-loss warmup" in report
     assert "GRPO Objective" not in report
+
+
+def test_mor_runs_generate_five_way_report(tmp_path) -> None:
+    rows = [
+        {
+            "model": "dense", "router_type": "none", "training_method": "supervised",
+            "seed": 42, "val_loss": 2.0, "val_perplexity": 7.4,
+            "layers_per_token": 8.0, "skip_fraction": 0.0,
+            "parameter_count": 2_000_000,
+            "estimated_executed_block_flops_per_sequence": 200.0,
+        },
+        {
+            "model": "mor", "router_type": "expert_linear",
+            "training_method": "supervised", "seed": 42, "val_loss": 2.1,
+            "val_perplexity": 8.2, "layers_per_token": 6.0, "skip_fraction": 0.25,
+            "parameter_count": 1_000_000,
+            "estimated_executed_block_flops_per_sequence": 140.0,
+        },
+    ]
+    report = report_markdown(rows, tmp_path)
+    assert report.startswith("# Mixture-of-Recursions")
+    assert "Middle-Cycle" in report
+    assert "oracle top-k" in report
+    assert "MoR + GRPO" in report

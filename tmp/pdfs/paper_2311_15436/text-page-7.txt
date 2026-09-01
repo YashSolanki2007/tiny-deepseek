@@ -1,0 +1,138 @@
+                                                                                                                                                                                                   Learning to Skip for Language Modeling
+
+                                                                                                                                                                                                                                                                                                                         51                                                                                                                      51
+
+
+
+
+                                                                                                                                                                                                                                                                                 SkipLayer (48, 25%)
+                  15
+
+
+
+
+                                                                                                                                                                                                                                                     SkipLayer (24, 50%)                                                                                                                                                                                                                                   SkipLayer (24, 50%)   SkipLayer (48, 25%)
+                                                                                                                                                                     15
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      Standard   WideFFN
+
+
+                                                                                                               SkipLayer (24, 25%)
+                                                                                                                                                                                                                                        Standard
+                                                                                                                                                                                                                                                                                                                         48                                                                                                                      48
+
+
+
+
+Avg Score (NLG)                                                                                                                                    Avg Score (NLG)                                                                                                                                     Avg Score (NLU)                                                                                    SkipLayer(24, 25%)   Avg Score (NLU)
+                                                                                                                                                                                                                        WideFFN
+                  10
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                                                                     SkipLayer(12, 50%)
+                                                                                                                                                                                                                                                                                                                                                                          Standard
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                   Random (24, 50%)
+                                                                                                                                                                     10
+
+
+
+
+                                                                                                                                                                                                   Random (24, 50%)
+                                                                                        SkipLayer (12, 50%)
+                                                                           WideFFN                                                                                                                                                                                                                                                                              WideFFN
+                                                                                                                                                                                                                                                                                                                         45                                                                                                                      45
+
+
+                                                             HighwayNet
+                                                  Standard
+
+                                                                                                                                                                                HighwayNet                                                                                                                                                         HighwayNet                                                                                         HighwayNet
+
+                              Random (12, 50%)
+                       5
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                Random (12, 50%)
+                                                                                                                                                                      5
+
+                                                                                                                                                                                                                                                                                                                         42                                                                                                                      42
+
+
+
+                       0                                                                                                                                              0
+
+                                                             Methods                                                                                                                                                    Methods                                                                                                                                 Methods                                                                                                               Methods
+
+                           (a) Avg. 1-shot (NLG, 6L)                                                                                                                  (b) Avg. 1-shot (NLG, 12L)                                                                                                                              (c) Avg. 1-shot (NLU, 6L)                                                                                           (d) Avg. 1-shot (NLU, 12L)
+
+Figure 5. Average 1-shot NLG and NLU performance of different methods with 6 (a-b) and 12 (c-d) effective number of activated layers,
+respectively.
+
+
+                       20
+                                                                                                                                                                                                                                                                                                                very deep FFN only networks. However, residual branch is
+                                                                                                                                                                                                                                                                                                                quite normal in today’s Transformer models, self-attention
+                                                                                                                                                       50.0
+                                                                                                                                                                                                                                                                                                                and FFN both have residuals. In our implementation, we
+
+     Avg Score (NLG)                                                                                                                 Avg Score (NLU)
+                       15
+                                                                                                                                                                                                                                                                                                                replace the original residual with the highway network resid-
+                                                                                                                                                       47.5
+                                                                                                                                                                                                                                                                                                                ual which leads to performance degradation. Figure 5(c-d)
+                       10
+                                                                                                                                                                                                                                                                                                                further compare the average 1-shot performance of different
+                                                                                     SkipLayer(24)
+                                                                                     L24Rand
+                                                                                                                                                       45.0                                                                                    SkipLayer(24)
+                                                                                                                                                                                                                                               L24Rand
+                                                                                                                                                                                                                                                                                                                methods across all the NLU tasks. With a similar trend ob-
+                                                                                     SkipLayer(48)
+                                                                                     L48Rand
+                                                                                                                                                                                                                                               SkipLayer(48)
+                                                                                                                                                                                                                                               L48Rand
+                                                                                                                                                                                                                                                                                                                served before, WideFFN has a scaling performance closer
+                            12%                  25%
+                                                             Density
+                                                                          50%                                 75%                                                         12%                25%
+                                                                                                                                                                                                                      Density
+                                                                                                                                                                                                                                  50%                                      75%                                  to the standard baseline models of 12 layers, both of which
+                                                                                                                                                                                                                                                                                                                significantly outperform the HighwayNet and the Random
+                            (a) Avg. 1-shot (NLG)                                                                                                                    (b) Avg. 1-shot (NLU)
+                                                                                                                                                                                                                                                                                                                gating method, and SkipLayer based models lead to the best
+                                                                                                                                                                                                                                                                                                                performance overall when the models scale up.
+Figure 6. Learned gating has significantly better performance than
+the respective methods using random gating.
+                                                                                                                                                                                                                                                                                                               Does the learned gating matter? The gating function
+                                                                                                                                                                                                                                                                                                               inside a SkipLayer enables each input example to activate a
+Figure 4(d) further shows the training speed on a single TPU                                                                                                                                                                                                                                                   subset of layers of the model based on the context. We have
+v4 of different SkipLayer models. In general, the training                                                                                                                                                                                                                                                     already observed that this flexibility of switching model
+speed decreases as more FLOPs are used per prediction.                                                                                                                                                                                                                                                         parameters improve the predictive accuracy of the model
+Compared to the respective full dense baselines, SkipLayer                                                                                                                                                                                                                                                     when it becomes deeper and sparser. We wonder how much
+(24, 50%) has 18% speed gains, and SkipLayer (48, 12.5%)                                                                                                                                                                                                                                                       gain the learned routing function can contribute to the pre-
+has 3x gains.                                                                                                                                                                                                                                                                                                  dictive performance of the SkipLayer-based models. We
+                                                                                                                                                                                                                                                                                                               approach this question by comparing the SkipLayer-based
+How does SkipLayer compare to the baselines? Fig-                                                                                                                                                                                                                                                              models with the respective Random gating baselines where
+ure 5(a-b) first compare the average 1-shot performance of                                                                                                                                                                                                                                                     the gating is not learned by varying the density of the model
+different methods of effective 6 layers and 12 layers across                                                                                                                                                                                                                                                   side-by-side in Figure 6. Because each token activates a
+all the NLG tasks. In Figure 5(a) when all models are small,                                                                                                                                                                                                                                                   layer randomly and independently, Random gating baselines
+HighwayNet has similar performance as the standard base-                                                                                                                                                                                                                                                       have the similar compute FLOPs per token prediction as
+line 6L model. They both outperform the Random gating                                                                                                                                                                                                                                                          the SkipLayer-based models given the same model density.
+method but marginally underperform the WideFFN method.                                                                                                                                                                                                                                                         However, as shown in Figure 6, for the same model density,
+When all the models become deeper in Figure 5(b), the stan-                                                                                                                                                                                                                                                    the learned gating of SkipLayer-based models performs
+dard baseline 12L scales better than WideFFN, HighwayNet                                                                                                                                                                                                                                                       significantly better than the respective methods using ran-
+and the Random gating method. However, in both cases,                                                                                                                                                                                                                                                          dom gating. Even though Random gating baselines also
+SkipLayer based models have achieved the best performance                                                                                                                                                                                                                                                      have the flexibility of switching model parameters per token
+compared to all the other baselines. HighwayNet performs                                                                                                                                                                                                                                                       prediction, Figure 6 verifies that the learned gating functions
+the worst among all the models we trained, one possible                                                                                                                                                                                                                                                        are much more effective to improve the prediction accuracy.
+reason could be Highway network is designed for FFN only
+architectures, it works like a weighted residual branch added                                                                                                                                                                                                                                                   How does the skipping behave during decoding? To
+to the wrapped layer, which helps the training stability of                                                                                                                                                                                                                                                     study the skipping behaviour of SkipLayer model and un-
+

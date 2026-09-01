@@ -1,0 +1,242 @@
+{
+  "model": "mor",
+  "router_type": "expert_linear",
+  "training_method": "supervised",
+  "seed": 42,
+  "target_density": 0.75,
+  "lambda_density": 0.0,
+  "paper_reproduction": true,
+  "mor_reproduction": true,
+  "experiment_family": "mor_comparison",
+  "n_layers": 8,
+  "effective_target_depth": 6.0,
+  "learning_rate": 0.01,
+  "sparse_inference": true,
+  "density_reduction": "sum",
+  "optimizer_name": "adafactor",
+  "parameter_count": 1344771,
+  "active_parameter_estimate": 1344771,
+  "training_time_sec": 390.2061147503555,
+  "seconds_per_step": 0.3349586663730443,
+  "tokens_per_sec": 10497.016436096914,
+  "dense_block_flops_per_sequence": 738197504.0,
+  "estimated_executed_block_flops_per_sequence": 502929337.76549315,
+  "estimated_flops_vs_full_dense": 0.6812937391962425,
+  "recursion_steps": 3,
+  "recursion_block_layers": 2,
+  "mor_capacity_factors": [
+    1.0,
+    0.6666666667,
+    0.3333333333
+  ],
+  "mor_aux_loss_coefficient": 0.001,
+  "checkpoint": "experiments/mor_comparison_seed42/mor_middle_cycle_R3_seed42/checkpoints/best_val_loss.pt",
+  "val_loss": 2.17036030292511,
+  "val_accuracy": 0.35498046875,
+  "density_loss": 1.5649209022521973,
+  "mean_soft_gate": 0.6233443140983581,
+  "mean_hard_gate": 0.68614501953125,
+  "layers_per_token": 5.48916015625,
+  "compute_fraction": 0.68614501953125,
+  "skip_fraction": 0.31385498046875,
+  "routing_entropy": 0.5593333601951599,
+  "val_perplexity": 8.761440244660266,
+  "validation_time_sec": 1.6712270840071142,
+  "layer_utilization": [
+    1.0,
+    1.0,
+    1.0,
+    0.724853515625,
+    0.724853515625,
+    0.01972656324505806,
+    0.01972656324505806,
+    1.0
+  ],
+  "layer_soft_probability": [
+    1.0,
+    0.7104313373565674,
+    0.7104313373565674,
+    0.6147615909576416,
+    0.6147615909576416,
+    0.1681843101978302,
+    0.1681843101978302,
+    1.0
+  ],
+  "recursion_utilization": [
+    1.0,
+    0.724853515625,
+    0.01972656324505806
+  ],
+  "recursion_soft_utilization": [
+    0.7104313373565674,
+    0.6147615909576416,
+    0.1681843101978302
+  ],
+  "mean_recursions_per_token": 1.7445800304412842,
+  "mor_aux_loss": 1.4037995398044587,
+  "mor_router_accuracy": 0.8207871496677399,
+  "generation_tokens_per_sec": 66.72524032557651,
+  "generation_ms_per_token": 14.986832495778799,
+  "generation_compute_fraction": 0.6499999761581421,
+  "pearson_nll_depth": -0.13036034388984713,
+  "spearman_nll_depth": -0.1490161116841424,
+  "difficulty_quantile_depth": [
+    5.69921875,
+    5.65673828125,
+    5.46240234375,
+    5.2607421875,
+    5.38671875
+  ],
+  "difficulty_quantile_labels": [
+    "0\u201320%",
+    "20\u201340%",
+    "40\u201360%",
+    "60\u201380%",
+    "80\u2013100%"
+  ],
+  "tokens_analyzed": 20480,
+  "most_skipped_tokens": [
+    {
+      "token_id": 22,
+      "token": "J",
+      "count": 1,
+      "average_skipped_layers": 4.0,
+      "average_executed_layers": 4.0
+    },
+    {
+      "token_id": 38,
+      "token": "Z",
+      "count": 10,
+      "average_skipped_layers": 4.0,
+      "average_executed_layers": 4.0
+    },
+    {
+      "token_id": 0,
+      "token": "\n",
+      "count": 790,
+      "average_skipped_layers": 3.946835443037975,
+      "average_executed_layers": 4.053164556962026
+    },
+    {
+      "token_id": 17,
+      "token": "E",
+      "count": 84,
+      "average_skipped_layers": 3.6904761904761907,
+      "average_executed_layers": 4.309523809523809
+    },
+    {
+      "token_id": 33,
+      "token": "U",
+      "count": 44,
+      "average_skipped_layers": 3.6818181818181817,
+      "average_executed_layers": 4.318181818181818
+    },
+    {
+      "token_id": 30,
+      "token": "R",
+      "count": 108,
+      "average_skipped_layers": 3.6296296296296298,
+      "average_executed_layers": 4.37037037037037
+    },
+    {
+      "token_id": 19,
+      "token": "G",
+      "count": 49,
+      "average_skipped_layers": 3.5918367346938775,
+      "average_executed_layers": 4.408163265306122
+    },
+    {
+      "token_id": 26,
+      "token": "N",
+      "count": 97,
+      "average_skipped_layers": 3.5876288659793816,
+      "average_executed_layers": 4.412371134020619
+    },
+    {
+      "token_id": 32,
+      "token": "T",
+      "count": 160,
+      "average_skipped_layers": 3.5625,
+      "average_executed_layers": 4.4375
+    },
+    {
+      "token_id": 15,
+      "token": "C",
+      "count": 57,
+      "average_skipped_layers": 3.543859649122807,
+      "average_executed_layers": 4.4561403508771935
+    }
+  ],
+  "least_skipped_tokens": [
+    {
+      "token_id": 42,
+      "token": "d",
+      "count": 552,
+      "average_skipped_layers": 1.9855072463768115,
+      "average_executed_layers": 6.0144927536231885
+    },
+    {
+      "token_id": 64,
+      "token": "z",
+      "count": 8,
+      "average_skipped_layers": 2.0,
+      "average_executed_layers": 6.0
+    },
+    {
+      "token_id": 62,
+      "token": "x",
+      "count": 3,
+      "average_skipped_layers": 2.0,
+      "average_executed_layers": 6.0
+    },
+    {
+      "token_id": 52,
+      "token": "n",
+      "count": 853,
+      "average_skipped_layers": 2.011723329425557,
+      "average_executed_layers": 5.988276670574443
+    },
+    {
+      "token_id": 43,
+      "token": "e",
+      "count": 1691,
+      "average_skipped_layers": 2.0413956238911886,
+      "average_executed_layers": 5.958604376108811
+    },
+    {
+      "token_id": 2,
+      "token": "!",
+      "count": 42,
+      "average_skipped_layers": 2.0476190476190474,
+      "average_executed_layers": 5.9523809523809526
+    },
+    {
+      "token_id": 45,
+      "token": "g",
+      "count": 208,
+      "average_skipped_layers": 2.0865384615384617,
+      "average_executed_layers": 5.913461538461538
+    },
+    {
+      "token_id": 56,
+      "token": "r",
+      "count": 833,
+      "average_skipped_layers": 2.1080432172869146,
+      "average_executed_layers": 5.891956782713086
+    },
+    {
+      "token_id": 63,
+      "token": "y",
+      "count": 363,
+      "average_skipped_layers": 2.1377410468319558,
+      "average_executed_layers": 5.862258953168045
+    },
+    {
+      "token_id": 54,
+      "token": "p",
+      "count": 202,
+      "average_skipped_layers": 2.1386138613861387,
+      "average_executed_layers": 5.861386138613861
+    }
+  ]
+}

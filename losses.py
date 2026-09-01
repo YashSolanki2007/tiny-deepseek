@@ -67,6 +67,7 @@ def clipped_grpo_loss_per_decision(
     advantage: torch.Tensor,
     clip_epsilon: float,
     trajectory_mask: torch.Tensor | None = None,
+    decision_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Clipped GRPO/PPO objective over token-layer routing decisions.
 
@@ -83,12 +84,18 @@ def clipped_grpo_loss_per_decision(
     clipped = ratio.clamp(1 - clip_epsilon, 1 + clip_epsilon)
     expanded_advantage = advantage[:, None, None].expand_as(ratio)
     surrogate = torch.minimum(ratio * expanded_advantage, clipped * expanded_advantage)
+    valid = torch.ones_like(ratio, dtype=torch.bool)
     if trajectory_mask is not None:
         if trajectory_mask.shape != (new_log_probability.shape[0],):
             raise ValueError("trajectory_mask must have shape [trajectories]")
-        valid = trajectory_mask[:, None, None].expand_as(ratio)
+        valid = valid & trajectory_mask[:, None, None]
+    if decision_mask is not None:
+        if decision_mask.shape != ratio.shape:
+            raise ValueError("decision_mask must match log-probability tensors")
+        valid = valid & decision_mask.bool()
+    if trajectory_mask is not None or decision_mask is not None:
         if not bool(valid.any()):
-            raise ValueError("trajectory_mask excludes every trajectory")
+            raise ValueError("masks exclude every routing decision")
         surrogate = surrogate[valid]
         ratio = ratio[valid]
         clipped = clipped[valid]

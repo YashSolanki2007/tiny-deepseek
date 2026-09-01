@@ -19,6 +19,7 @@ from evaluation import evaluate_model
 from generate import generate_tokens
 from utils import (
     estimate_dense_block_flops,
+    estimate_mor_flops,
     estimate_skiplayer_flops,
     load_checkpoint,
     select_device,
@@ -49,6 +50,12 @@ def evaluate_checkpoint(
             estimated_flops = estimate_dense_block_flops(
                 model.config, model.config.context_length
             )
+        elif model.config.model_type == "mor":
+            estimated_flops = estimate_mor_flops(
+                model.config,
+                model.config.context_length,
+                metrics["recursion_utilization"],
+            )
         else:
             estimated_flops = estimate_skiplayer_flops(
                 model.config,
@@ -56,6 +63,9 @@ def evaluate_checkpoint(
                 metrics["compute_fraction"],
             )
         metrics["estimated_executed_block_flops_per_sequence"] = estimated_flops
+        metrics["estimated_flops_vs_full_dense"] = estimated_flops / estimate_dense_block_flops(
+            model.config, model.config.context_length
+        )
     prompt = "ROMEO:"
     ids = torch.tensor([[dataset.stoi[ch] for ch in prompt]], dtype=torch.long, device=device)
     generated_ids, generation_gates, elapsed = generate_tokens(
@@ -74,7 +84,7 @@ def evaluate_checkpoint(
     (samples_dir / "evaluation_sample.txt").write_text(sample + "\n", encoding="utf-8")
     plots = experiment_dir / "plots"
     save_difficulty_plot(difficulty, plots / "difficulty_vs_depth")
-    if model.config.model_type == "sparse":
+    if model.config.model_type in {"sparse", "mor"}:
         routing_dir = experiment_dir / "routing_visualizations"
         text = "ROMEO:\nWhat light through yonder window breaks?"
         save_routing_heatmap(model, dataset.stoi, text, "soft", routing_dir / "routing_soft.png")
@@ -101,6 +111,8 @@ def evaluate_checkpoint(
             + router_parameters
             + metrics["compute_fraction"] * block_parameters
         )
+    elif model.config.model_type == "mor":
+        summary["active_parameter_estimate"] = model.parameter_count()
     summary["checkpoint"] = str(checkpoint_path)
     write_json(summary_path, summary)
     print(

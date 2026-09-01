@@ -21,9 +21,11 @@ def numeric(value: str):
 
 def short_label(item: dict) -> str:
     if item.get("model") == "dense":
-        return f"Dense L{item.get('n_layers') or 4}"
+        return f"Full dense L{item.get('n_layers') or 8}"
+    if item.get("model") == "mor":
+        return "MoR + GRPO" if item.get("training_method") == "grpo" else "MoR"
     if item.get("training_method") == "grpo":
-        return f"Budget GRPO λ={item.get('lambda_grpo')}"
+        return "SkipLayer + GRPO"
     return "Supervised SkipLayer"
 
 
@@ -76,6 +78,22 @@ def per_experiment_plots(experiment: Path) -> None:
     plot_series(rows, [("mean_reward", "mean reward")], "GRPO reward", "Reward", plots / "grpo_reward")
     plot_series(rows, [("mean_ce_component", "CE"), ("mean_compute_penalty", "compute"), ("mean_kl", "KL")], "GRPO reward components", "Component value", plots / "grpo_components")
     plot_series(rows, [("routing_entropy", "entropy")], "Routing entropy", "Entropy (nats)", plots / "routing_entropy")
+    plot_series(rows, [("mor_aux_loss", "auxiliary BCE")], "MoR auxiliary router loss", "BCE", plots / "mor_aux_loss")
+    plot_series(rows, [("mor_router_accuracy", "threshold accuracy")], "MoR router sampling accuracy", "Accuracy", plots / "mor_router_accuracy")
+    plot_series(rows, [("estimated_flops_vs_full_dense", "relative FLOPs")], "Estimated FLOPs", "Fraction of full dense", plots / "estimated_flops")
+
+    recursion_keys = sorted(
+        [key for key in rows[0] if key.startswith("recursion_") and key.endswith("_utilization") and "soft" not in key],
+        key=lambda key: int(key.split("_")[1]),
+    ) if rows else []
+    if recursion_keys:
+        plot_series(
+            rows,
+            [(key, f"recursion {key.split('_')[1]}") for key in recursion_keys],
+            "Recursion utilization",
+            "Active token fraction",
+            plots / "recursion_utilization",
+        )
 
     budget_depth_keys = sorted(
         [key for key in rows[0] if key.startswith("budget_") and key.endswith("_depth")],

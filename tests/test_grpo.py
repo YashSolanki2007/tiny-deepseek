@@ -51,3 +51,20 @@ def test_per_decision_objective_excludes_anchor_trajectory() -> None:
     torch.testing.assert_close(loss, torch.tensor(-1.0))
     torch.testing.assert_close(ratio, torch.tensor(1.0))
     torch.testing.assert_close(clip_fraction, torch.tensor(0.0))
+
+
+def test_per_decision_objective_honors_hierarchical_decision_mask() -> None:
+    behavior = torch.zeros(1, 2, 3)
+    current = behavior.clone()
+    current[0, 1, 2] = 10.0
+    decision_mask = torch.tensor([[[False, True, False], [False, True, False]]])
+    loss, ratio, clipped = clipped_grpo_loss_per_decision(
+        current,
+        behavior,
+        torch.tensor([1.0]),
+        clip_epsilon=0.2,
+        decision_mask=decision_mask,
+    )
+    torch.testing.assert_close(loss, torch.tensor(-1.0))
+    torch.testing.assert_close(ratio, torch.tensor(1.0))
+    torch.testing.assert_close(clipped, torch.tensor(0.0))

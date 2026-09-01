@@ -1,0 +1,73 @@
+{
+  "stage": "grpo",
+  "model": {
+    "vocab_size": 65,
+    "context_length": 128,
+    "d_model": 256,
+    "n_heads": 4,
+    "n_layers": 8,
+    "d_ff": 1024,
+    "dropout": 0.1,
+    "model_type": "sparse",
+    "router_type": "gru",
+    "router_dim": 32,
+    "gumbel_temperature": 1.0,
+    "initial_execute_probability": 0.9,
+    "tie_weights": true
+  },
+  "grpo": {
+    "max_steps": 1000,
+    "batch_size": 8,
+    "group_size": 4,
+    "policy_epochs": 2,
+    "learning_rate": 0.0001,
+    "transformer_lr_scale": 0.1,
+    "lambda_compute_grpo": 0.1,
+    "beta_kl": 0.01,
+    "clip_epsilon": 0.2,
+    "grad_clip": 1.0,
+    "eval_interval": 100,
+    "eval_iters": 20,
+    "log_interval": 10,
+    "router_only": true,
+    "kl_in_reward": false,
+    "seed": 42
+  },
+  "device": "mps",
+  "supervised_checkpoint": "experiments/gru_P050_lam0.1_seed42/checkpoints/best_val_loss.pt",
+  "target_density": 0.5,
+  "before_grpo": {
+    "val_loss": 1.5183556795120239,
+    "val_accuracy": 0.547314453125,
+    "density_loss": 0.25,
+    "mean_soft_gate": 0.9950762420892716,
+    "mean_hard_gate": 1.0,
+    "layers_per_token": 8.0,
+    "compute_fraction": 1.0,
+    "skip_fraction": 0.0,
+    "routing_entropy": 0.02433076798915863,
+    "val_perplexity": 4.564713169359675,
+    "validation_time_sec": 0.8911510407924652,
+    "layer_utilization": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "layer_soft_probability": [
+      0.9999960660934448,
+      0.999118447303772,
+      0.9699419736862183,
+      0.9927747845649719,
+      0.9989740252494812,
+      0.9998723268508911,
+      0.9999481439590454,
+      0.999984085559845
+    ]
+  },
+  "old_policy_state": "Old action log-probabilities are retained per rollout; checkpoints occur only between rollouts."
+}
