@@ -44,29 +44,6 @@ Device selection uses CUDA first, Apple MPS second, and CPU otherwise. Pass
 
 ## Current Tiny-deepseek architectures
 
-### Tiny Shakespeare model
-
-The latest Shakespeare model uses the following configuration:
-
-| Component | Configuration |
-|---|---|
-| Dataset | Tiny Shakespeare, character-level |
-| Vocabulary | 65 characters |
-| Context | 128 tokens |
-| Main decoder | 8 layers, width 128, 2 heads, FFN width 1024 |
-| Dynamic depth | Linear SkipLayer router with greedy sparse inference |
-| MoE | 10 experts per layer, top-2 active, expert width 512 |
-| Attention | MLA, KV latent rank 32 |
-| MLA heads | 32 content dimensions, 32 RoPE dimensions, 64 value dimensions |
-| Positions | RoPE with theta 10,000 |
-| MTP | One causal Transformer block predicting `t+2` |
-| Stored parameters | 11.283M |
-
-The MTP module receives a normalized main-model hidden state and the embedding of
-the observed next token. These representations are concatenated, projected, passed
-through one causal Transformer block, and decoded with the shared language-model
-head. The MTP loss coefficient is `0.3`.
-
 ### Mathematical-reasoning model
 
 The math experiment increases model capacity while retaining the same components:
