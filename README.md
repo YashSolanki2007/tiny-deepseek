@@ -420,6 +420,170 @@ Inspect live metrics with:
 tensorboard --logdir experiments
 ```
 
+## SkipLayer + GRPO + 10-expert MoE + MTP attention variants
+
+The bounded extension keeps the eight-layer SkipLayer backbone and its budget-guided
+GRPO policy, replaces each block FFN with ten routed FFN experts, and activates the
+top two experts per executed token. Each expert has half the original FFN width, so
+the two active experts have approximately the same FFN multiply-add count as one
+original dense FFN; stored capacity grows, but all ten experts are not executed.
+
+Expert affinities use sigmoid gating and normalize across the selected experts. A
+non-gradient selection bias is updated from batch load, with a very small auxiliary
+balance loss. No tokens are dropped. The MTP branch follows the one-depth construction
+in the [DeepSeek-V3 report](https://arxiv.org/html/2412.19437v2): normalized main hidden
+state and the shared next-token embedding are concatenated and projected, one causal
+Transformer block predicts `t+2`, and the embedding/output head are shared. MTP has
+weight 0.3 during adaptation. Ordinary autoregressive decoding can omit it; the
+speculative path below reuses it as a one-block draft model.
+
+The current default replaces learned absolute positions and ordinary MHA with
+DeepSeek-style Multi-Head Latent Attention and RoPE. KV content is compressed to a
+32-dimensional shared latent, query/key dimensions are split into 32 content and 32
+rotary dimensions per head, and values remain 64-dimensional per head. Full causal
+passes call PyTorch scaled-dot-product attention, which selects FlashAttention on
+supported CUDA hardware and an optimized SDPA fallback on MPS. Sparse inference still
+keeps every token as KV context and evaluates attention outputs only for executed queries.
+
+### Exact model used for the reported generations
+
+The samples and latency numbers below come from this post-GRPO checkpoint:
+
+```text
+experiments/skiplayer_moe_mtp_mla_rope_seed42/grpo/checkpoints/best_quality_compute.pt
+```
+
+| Component | Configuration |
+|---|---|
+| Data and tokens | Tiny Shakespeare, character-level, 65-character vocabulary |
+| Main decoder | 8 Transformer layers, width 128, 2 attention heads, FFN width 1024 |
+| Context | 128 tokens |
+| Regularization | Dropout 0.0; input/output token weights tied |
+| Dynamic depth | Linear SkipLayer router, normalized layer input, no router bias, router width 32 |
+| Inference routing | Deterministic greedy gates with sparse selected-query/block execution |
+| MoE | 10 FFN experts per layer, top-2 active, expert FFN width 512, no token dropping |
+| Attention | MLA with query rank 0, shared KV latent rank 32, 32 content dimensions, 32 RoPE dimensions, and 64 value dimensions per head |
+| Positions | RoPE with base theta 10,000; no learned absolute position embedding |
+| MTP draft | One additional causal Transformer block predicting `t+2`, sharing token embeddings and the LM head |
+| Training objectives | MTP coefficient 0.3 and MoE auxiliary balance coefficient 0.0001 |
+| GRPO policy stage | Router-only, 120 steps, depth budgets 3/4/5/8, compute coefficient 1.0, KL coefficient 0.01, PPO clip 0.5, exploration mixture 0.8 |
+| Training seed | 42 |
+
+The checkpoint's matched validation result is CE `2.0679`, perplexity `7.9080`,
+next-character accuracy `38.65%`, average executed depth `4.5936/8`, and estimated
+block FLOPs `0.5645x` the full dense reference. These values measure the target model;
+speculative decoding preserves its sampling distribution and only changes how target
+tokens are computed.
+
+Run the short end-to-end experiment:
+
+```bash
+python run_skiplayer_moe_mtp.py \
+  --supervised-steps 250 \
+  --grpo-steps 120 \
+  --eval-iters 10 \
+  --device auto
+```
+
+Watch both stages while they run:
+
+```bash
+tensorboard \
+  --logdir /Users/yashsolanki/Desktop/layer-skipper/experiments/skiplayer_moe_mtp_mla_rope_seed42 \
+  --port 6006
+```
+
+The logger records main CE/accuracy, `t+2` CE/accuracy, total objective, skip depth,
+per-layer skip utilization, GRPO reward/KL/clipping, MoE entropy/balance/CV, all 80
+layer-expert utilization and affinity series, estimated inference FLOPs, and wall-clock
+throughput. Rebuild the matched comparison with:
+
+```bash
+python compare_skiplayer_moe_mtp.py --eval-iters 20 --batch-size 8 --device auto
+```
+
+The seed-42, 20-batch deterministic Shakespeare comparison produced:
+
+| Model | Validation CE | Perplexity | Accuracy | Layers/token | FLOPs vs dense | Stored params | Active-param estimate |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| SkipLayer + GRPO | 2.1452 | 8.5439 | 37.06% | 4.3846 | 0.5899x | 2.666M | 1.473M |
+| + MoE + MTP, MHA + learned positions | 1.9854 | 7.2819 | 41.11% | 4.7030 | 0.6281x | 11.470M | 1.585M |
+| + MoE + MTP, MLA + RoPE | 2.0679 | 7.9080 | 38.65% | 4.5936 | 0.5645x | 11.283M | 1.445M |
+
+This run strongly improved quality but did **not** beat the prior point on FLOPs:
+accuracy increased by 4.05 percentage points and CE fell by 0.1598, while estimated
+inference FLOPs increased by 0.0383 of the full-dense reference. GRPO reduced the
+adapted model from about 4.84 to 4.71 layers/token with only a small CE change. The
+MLA+RoPE run is a different Pareto point. Relative to the original SkipLayer+GRPO,
+it improves CE by 0.0773 and accuracy by 1.59 percentage points while also reducing
+FLOPs from 0.5899x to 0.5645x. Relative to the MHA+MoE+MTP run, MLA+RoPE saves 0.0636
+of full-dense FLOPs but gives back 2.46 accuracy points. These are short single-seed
+combined interventions; separate attention-only, MoE-only, MTP-only, and equal-token
+ablations are required for causal attribution.
+
+### One-block MTP speculative decoding
+
+The trained `t+2` MTP module can draft one token after a target-model token. The
+target evaluates the draft and one bonus position in a single parallel causal pass.
+Accepted drafts are retained; rejected drafts use the normalized positive residual
+`max(0, p_target - p_draft)`. Consequently this samples from the same temperature and
+top-k transformed target distribution rather than silently changing model quality.
+
+Benchmark it and write three generations with:
+
+```bash
+python speculative_decode.py \
+  --checkpoint experiments/skiplayer_moe_mtp_mla_rope_seed42/grpo/checkpoints/best_quality_compute.pt \
+  --benchmark-tokens 96 \
+  --benchmark-repeats 3 \
+  --sample-tokens 80 \
+  --device auto
+```
+
+Outputs are written to `results/speculative_mla_rope_seed42/results.json` and
+`generations.txt`. The benchmark stays within the 128-token trained context and
+reports MTP acceptance, full-target call reduction, and synchronized wall-clock
+throughput. This implementation has no KV cache, so latency results characterize
+this repository's full-prefix decoder rather than production serving kernels.
+
+On Apple MPS, the seed-2026 benchmark above produced these three-repeat medians:
+
+| Decoder | Time for 96 tokens | Tokens/s | Mean full-target calls |
+|---|---:|---:|---:|
+| Ordinary autoregressive | 6.519 s | 14.73 | 96.00 |
+| One-block MTP speculative | 4.253 s | 22.57 | 63.33 |
+
+That is a measured `1.53x` speedup, with `69.44%` draft acceptance and `34.03%`
+fewer full-target calls. It is a local, short-sequence measurement rather than a
+general hardware-independent speed claim.
+
+The benchmark used temperature `0.8`, top-k `40`, prompt `ROMEO:`, 96 generated
+characters, and seeds `2026`–`2028`. The displayed samples use 80 generated
+characters and seeds `2027`, `2028`, and `2029` respectively:
+
+```text
+ROMEO:
+And as say chave rour was and heing me chard?
+GLAPURETE:
+They my dinens this wh
+```
+
+```text
+JULIET:
+Derve his the lood of the whe sacar
+Werve.'s buke sort and it what ding tight m
+```
+
+```text
+KING RICHARD:
+I che it grie be earrow, the swill, but cour eing 'dut of cour this pear
+Nould
+```
+
+This is a short-trained character model, so the generations remain noisy. The speed
+comparison is the relevant speculative-decoding result; it is not a claim that the
+small checkpoint has LLM-level generation quality.
+
 ## Resume
 
 Supervised:
@@ -446,7 +610,7 @@ Checkpoints include model, optimizer, scheduler, step, seed/configuration, RNG s
 pytest -q
 ```
 
-Tests cover exact skip/execute semantics, dense and sparse output shapes, hard binary gates, initial execute probability, linear and GRU router gradients, GRU depth-state propagation, target-density loss, schedule warmup, routing-trajectory diversity, GRPO reward/advantages/clipping, and numerically exact greedy checkpoint restoration.
+Tests cover exact skip/execute semantics, dense and sparse output shapes, hard binary gates, initial execute probability, linear and GRU router gradients, GRU depth-state propagation, target-density loss, schedule warmup, routing-trajectory diversity, GRPO reward/advantages/clipping, MLA+RoPE execution, selected-query equivalence, and numerically exact greedy checkpoint restoration.
 
 ## File map
 

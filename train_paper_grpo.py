@@ -15,10 +15,12 @@ from data import TinyShakespeareData
 from evaluation import evaluate_model
 from logging_utils import StructuredLogger
 from losses import clipped_grpo_loss_per_decision, grpo_reward, group_relative_advantages
-from model import SparseDepthTransformer
+from model import SparseDepthTransformer, SparseMoEMTPTransformer
 from utils import (
     estimate_dense_block_flops,
+    estimate_mla_skiplayer_moe_mtp_flops,
     estimate_skiplayer_flops,
+    estimate_sparse_moe_mtp_flops,
     gradient_norm,
     load_checkpoint,
     restore_training_state,
@@ -41,6 +43,8 @@ BASE_FIELDS = [
     "layers_per_token", "compute_fraction", "skip_fraction", "validation_time_sec",
     "estimated_block_flops", "estimated_flops_vs_dense",
     "estimated_flops_vs_full_dense",
+    "mtp_loss", "mtp_accuracy", "moe_aux_loss", "moe_router_entropy",
+    "expert_utilization_min", "expert_utilization_max", "expert_utilization_cv",
 ]
 
 
@@ -56,9 +60,14 @@ def add_flop_metrics(
     metrics: dict[str, Any], model: SparseDepthTransformer, target_density: float
 ) -> dict[str, Any]:
     density = float(metrics["compute_fraction"])
-    sequence_flops = estimate_skiplayer_flops(
-        model.config, model.config.context_length, density
+    estimator = (
+        estimate_mla_skiplayer_moe_mtp_flops
+        if model.config.attention_type == "mla"
+        else estimate_sparse_moe_mtp_flops
+        if isinstance(model, SparseMoEMTPTransformer)
+        else estimate_skiplayer_flops
     )
+    sequence_flops = estimator(model.config, model.config.context_length, density)
     effective_depth_dense = copy.copy(model.config)
     effective_depth_dense.n_layers = max(
         1, round(model.config.n_layers * target_density)
@@ -232,9 +241,18 @@ def main() -> None:
             "depth", "ce", "reward", "flops_vs_dense", "flops_vs_full_dense"
         )
     ]
+    expert_fields = (
+        [
+            f"layer_{layer}_expert_{expert}_{kind}"
+            for layer in range(model.config.n_layers)
+            for expert in range(model.config.moe_num_experts)
+            for kind in ("utilization", "affinity")
+        ]
+        if isinstance(model, SparseMoEMTPTransformer) else []
+    )
     logger = StructuredLogger(
         experiment_dir,
-        BASE_FIELDS + budget_fields,
+        BASE_FIELDS + budget_fields + expert_fields,
         purge_step=start_step if args.resume else None,
     )
     latest_eval = before_metrics
@@ -246,6 +264,16 @@ def main() -> None:
     print(
         f"device={device} paper-GRPO budgets={budgets} epsilon={args.exploration_epsilon} "
         f"lambda_compute={args.lambda_compute_grpo} beta_kl={args.beta_kl}"
+    )
+    forward_options = (
+        {"compute_mtp": False} if isinstance(model, SparseMoEMTPTransformer) else {}
+    )
+    flop_estimator = (
+        estimate_mla_skiplayer_moe_mtp_flops
+        if model.config.attention_type == "mla"
+        else estimate_sparse_moe_mtp_flops
+        if isinstance(model, SparseMoEMTPTransformer)
+        else estimate_skiplayer_flops
     )
 
     try:
@@ -273,6 +301,7 @@ def main() -> None:
                     routing_mode="budget",
                     target_depths=trajectory_budgets,
                     exploration_epsilon=epsilons,
+                    **forward_options,
                 )
                 reference = model(
                     x,
@@ -280,6 +309,7 @@ def main() -> None:
                     actions=sampled.actions,
                     routing_mode="greedy",
                     router_override=reference_router,
+                    **forward_options,
                 )
                 sequence_ce = sampled.token_losses.mean(dim=1)
                 compute = sampled.hard_gates.float().mean(dim=(1, 2))
@@ -299,7 +329,9 @@ def main() -> None:
             policy_losses, kls, entropies, ratios, clips = [], [], [], [], []
             for _ in range(args.policy_epochs):
                 model.train()
-                current = model(x, y, actions=actions, routing_mode="greedy")
+                current = model(
+                    x, y, actions=actions, routing_mode="greedy", **forward_options
+                )
                 with torch.no_grad():
                     reference = model(
                         x,
@@ -307,6 +339,7 @@ def main() -> None:
                         actions=actions,
                         routing_mode="greedy",
                         router_override=reference_router,
+                        **forward_options,
                     )
                 policy_loss, mean_ratio, clip_fraction = clipped_grpo_loss_per_decision(
                     current.action_log_probs,
@@ -375,7 +408,7 @@ def main() -> None:
                 selector = torch.arange(group_index, x.shape[0], group_size, device=device)
                 budget_compute = compute[selector].mean()
                 budget_depth = budget_compute * model.config.n_layers
-                budget_flops = estimate_skiplayer_flops(
+                budget_flops = flop_estimator(
                     model.config, model.config.context_length, budget_compute.item()
                 )
                 latest_train.update(
@@ -407,7 +440,14 @@ def main() -> None:
                     model, dataset, device, args.batch_size, args.eval_iters, target_density
                 )
                 latest_eval = add_flop_metrics(latest_eval, model, target_density)
-                logger.log({"split": "validation", **latest_eval}, step)
+                eval_row = {"split": "validation", **latest_eval}
+                for layer, values in enumerate(latest_eval.get("expert_utilization", [])):
+                    for expert, value in enumerate(values):
+                        eval_row[f"layer_{layer}_expert_{expert}_utilization"] = value
+                for layer, values in enumerate(latest_eval.get("expert_affinity", [])):
+                    for expert, value in enumerate(values):
+                        eval_row[f"layer_{layer}_expert_{expert}_affinity"] = value
+                logger.log(eval_row, step)
                 score = latest_eval["val_loss"] + args.lambda_compute_grpo * latest_eval["compute_fraction"]
                 checkpoint_kwargs = dict(
                     model=model,
@@ -457,14 +497,37 @@ def main() -> None:
     )
     router_parameters = sum(parameter.numel() for parameter in model.router.parameters())
     always_active = model.parameter_count() - block_parameters - router_parameters
-    active_parameters = (
-        always_active
-        + router_parameters
-        + latest_eval["compute_fraction"] * block_parameters
-    )
+    if isinstance(model, SparseMoEMTPTransformer):
+        mtp_parameters = sum(
+            parameter.numel()
+            for module in (
+                model.mtp_hidden_norm, model.mtp_token_norm, model.mtp_projection,
+                model.mtp_block, model.mtp_output_norm,
+            )
+            for parameter in module.parameters()
+        )
+        always_active -= mtp_parameters
+        expert_parameters = sum(
+            parameter.numel()
+            for block in model.blocks
+            for expert in block.mlp.experts
+            for parameter in expert.parameters()
+        )
+        non_expert_blocks = block_parameters - expert_parameters
+        active_expert_fraction = model.config.moe_top_k / model.config.moe_num_experts
+        active_parameters = (
+            always_active + router_parameters
+            + latest_eval["compute_fraction"]
+            * (non_expert_blocks + active_expert_fraction * expert_parameters)
+        )
+    else:
+        active_parameters = (
+            always_active + router_parameters
+            + latest_eval["compute_fraction"] * block_parameters
+        )
     selected_checkpoint = experiment_dir / "checkpoints" / "best_quality_compute.pt"
     summary = {
-        "model": "sparse",
+        "model": model.config.model_type,
         "router_type": "linear",
         "training_method": "grpo",
         "grpo_variant": "budget_guided_per_decision",
@@ -479,6 +542,19 @@ def main() -> None:
         "exploration_epsilon": args.exploration_epsilon,
         "ppo_clip_epsilon": args.clip_epsilon,
         "parameter_count": model.parameter_count(),
+        "inference_parameter_count": (
+            model.parameter_count() - mtp_parameters
+            if isinstance(model, SparseMoEMTPTransformer) else model.parameter_count()
+        ),
+        "moe_num_experts": (
+            model.config.moe_num_experts if isinstance(model, SparseMoEMTPTransformer) else None
+        ),
+        "moe_top_k": (
+            model.config.moe_top_k if isinstance(model, SparseMoEMTPTransformer) else None
+        ),
+        "mtp_prediction_depth": (
+            1 if isinstance(model, SparseMoEMTPTransformer) else None
+        ),
         "active_parameter_estimate": active_parameters,
         "training_time_sec": training_seconds,
         "tokens_per_sec": (

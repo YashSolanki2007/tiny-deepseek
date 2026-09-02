@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from config import ModelConfig
-from model import TransformerBlock, apply_block_gate, build_model
+from model import MultiHeadLatentAttention, TransformerBlock, apply_block_gate, build_model
 from utils import estimate_dense_block_flops, estimate_mor_flops, estimate_mor_skip_flops
 
 
@@ -48,6 +48,63 @@ def test_sparse_output_shapes_and_hard_binary_forward() -> None:
         assert output.hard_gates.shape == (2, 8, 3)
         assert output.route_logits.shape == (2, 8, 3, 2)
         assert set(output.hard_gates.detach().unique().tolist()) <= {0.0, 1.0}
+
+
+def test_sparse_moe_mtp_outputs_and_expert_accounting() -> None:
+    config = tiny_config(
+        model_type="sparse_moe_mtp", router_type="linear",
+        moe_num_experts=10, moe_top_k=2,
+    )
+    model = build_model(config)
+    token_ids = torch.randint(0, config.vocab_size, (2, config.context_length))
+    targets = torch.randint(0, config.vocab_size, token_ids.shape)
+    output = model(token_ids, targets, routing_mode="gumbel")
+    assert output.mtp_logits.shape == (2, config.context_length - 1, config.vocab_size)
+    assert output.expert_utilization.shape == (config.n_layers, 10)
+    torch.testing.assert_close(output.expert_utilization.sum(dim=-1), torch.ones(config.n_layers))
+    assert torch.isfinite(output.mtp_loss)
+    assert torch.isfinite(output.moe_aux_loss)
+
+
+def test_sparse_moe_mtp_can_discard_training_only_mtp_module() -> None:
+    config = tiny_config(model_type="sparse_moe_mtp", router_type="linear")
+    model = build_model(config).eval()
+    token_ids = torch.randint(0, config.vocab_size, (2, config.context_length))
+    output = model(token_ids, token_ids, routing_mode="greedy", compute_mtp=False)
+    assert output.mtp_logits is None
+    assert output.mtp_loss is None
+
+
+def test_mla_variant_replaces_absolute_positions_and_runs_mtp() -> None:
+    config = tiny_config(
+        model_type="sparse_moe_mtp_mla", router_type="linear",
+        moe_num_experts=10, moe_top_k=2,
+    )
+    model = build_model(config).eval()
+    assert model.position_embedding is None
+    assert isinstance(model.blocks[0].attn, MultiHeadLatentAttention)
+    assert model.config.position_embedding_type == "rope"
+    token_ids = torch.randint(0, config.vocab_size, (2, config.context_length))
+    output = model(token_ids, token_ids, routing_mode="greedy")
+    assert output.logits.shape == (2, config.context_length, config.vocab_size)
+    assert output.mtp_logits.shape == (2, config.context_length - 1, config.vocab_size)
+    assert torch.isfinite(output.logits).all()
+
+
+def test_mla_sparse_selected_queries_match_dense_masked_semantics() -> None:
+    torch.manual_seed(91)
+    config = tiny_config(model_type="sparse_moe_mtp_mla", router_type="linear")
+    block = TransformerBlock(config).eval()
+    x = torch.randn(2, config.context_length, config.d_model)
+    active = torch.tensor(
+        [
+            [False, True, False, True, True, False, True, False],
+            [True, False, False, True, False, True, False, True],
+        ]
+    )
+    dense_masked = apply_block_gate(x, block(x), active.unsqueeze(-1).float())
+    sparse = block.forward_selected(x, active)
+    torch.testing.assert_close(sparse, dense_masked, rtol=2e-5, atol=2e-6)
 
 
 def test_budget_controller_hits_exact_depth_when_fully_enabled() -> None:

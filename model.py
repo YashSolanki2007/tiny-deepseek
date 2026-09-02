@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import torch
@@ -37,6 +37,14 @@ class ModelOutput:
     skip_conditional_utilization: Optional[torch.Tensor] = None
     skip_soft_conditional_utilization: Optional[torch.Tensor] = None
     combined_block_utilization: Optional[torch.Tensor] = None
+    hidden_states: Optional[torch.Tensor] = None
+    moe_aux_loss: Optional[torch.Tensor] = None
+    moe_router_entropy: Optional[torch.Tensor] = None
+    expert_utilization: Optional[torch.Tensor] = None
+    expert_affinity: Optional[torch.Tensor] = None
+    mtp_logits: Optional[torch.Tensor] = None
+    mtp_loss: Optional[torch.Tensor] = None
+    mtp_accuracy: Optional[torch.Tensor] = None
 
 
 class CausalSelfAttention(nn.Module):
@@ -104,6 +112,141 @@ class CausalSelfAttention(nn.Module):
         return selected_outputs, selected_indices
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, dimension: int, epsilon: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dimension))
+        self.epsilon = epsilon
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        normalized = x.float() * torch.rsqrt(
+            x.float().pow(2).mean(dim=-1, keepdim=True) + self.epsilon
+        )
+        return normalized.to(x.dtype) * self.weight
+
+
+def apply_rotary_embedding(x: torch.Tensor, theta: float) -> torch.Tensor:
+    """Apply interleaved RoPE to `[batch, heads, sequence, dimension]`."""
+    dimension = x.shape[-1]
+    if dimension % 2:
+        raise ValueError("RoPE dimension must be even")
+    positions = torch.arange(x.shape[-2], device=x.device, dtype=torch.float32)
+    inverse_frequency = 1.0 / (
+        theta ** (torch.arange(0, dimension, 2, device=x.device).float() / dimension)
+    )
+    angles = torch.outer(positions, inverse_frequency)
+    cosine = angles.cos()[None, None]
+    sine = angles.sin()[None, None]
+    even, odd = x.float()[..., 0::2], x.float()[..., 1::2]
+    rotated = torch.stack(
+        (even * cosine - odd * sine, even * sine + odd * cosine), dim=-1
+    ).flatten(-2)
+    return rotated.to(x.dtype)
+
+
+class MultiHeadLatentAttention(nn.Module):
+    """DeepSeek-style MLA with partial RoPE and PyTorch fused SDPA.
+
+    KV content is compressed into one shared latent vector per token. Positional
+    key dimensions bypass that bottleneck and are shared across heads, matching
+    MLA's decoupled-RoPE construction.
+    """
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.n_heads = config.n_heads
+        self.q_rank = config.mla_q_lora_rank
+        self.kv_rank = config.mla_kv_lora_rank
+        self.nope_dim = config.mla_qk_nope_head_dim
+        self.rope_dim = config.mla_qk_rope_head_dim
+        self.qk_dim = self.nope_dim + self.rope_dim
+        self.value_dim = config.mla_v_head_dim
+        self.theta = config.rope_theta
+        self.dropout = config.dropout
+        if self.q_rank > 0:
+            self.q_down = nn.Linear(config.d_model, self.q_rank, bias=False)
+            self.q_norm = RMSNorm(self.q_rank)
+            self.q_up = nn.Linear(self.q_rank, self.n_heads * self.qk_dim, bias=False)
+        else:
+            self.q_proj = nn.Linear(config.d_model, self.n_heads * self.qk_dim, bias=False)
+        self.kv_down = nn.Linear(
+            config.d_model, self.kv_rank + self.rope_dim, bias=False
+        )
+        self.kv_norm = RMSNorm(self.kv_rank)
+        self.kv_up = nn.Linear(
+            self.kv_rank,
+            self.n_heads * (self.nope_dim + self.value_dim),
+            bias=False,
+        )
+        self.output = nn.Linear(self.n_heads * self.value_dim, config.d_model, bias=False)
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+    def _project(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch, seq_len, _ = x.shape
+        if self.q_rank > 0:
+            q = self.q_up(self.q_norm(self.q_down(x)))
+        else:
+            q = self.q_proj(x)
+        q = q.view(batch, seq_len, self.n_heads, self.qk_dim).transpose(1, 2)
+        q_nope, q_rope = q.split((self.nope_dim, self.rope_dim), dim=-1)
+        q_rope = apply_rotary_embedding(q_rope, self.theta)
+
+        latent_and_rope = self.kv_down(x)
+        latent, k_rope = latent_and_rope.split((self.kv_rank, self.rope_dim), dim=-1)
+        expanded = self.kv_up(self.kv_norm(latent))
+        expanded = expanded.view(
+            batch, seq_len, self.n_heads, self.nope_dim + self.value_dim
+        ).transpose(1, 2)
+        k_nope, value = expanded.split((self.nope_dim, self.value_dim), dim=-1)
+        k_rope = apply_rotary_embedding(k_rope[:, None], self.theta)
+        key = torch.cat((k_nope, k_rope.expand(-1, self.n_heads, -1, -1)), dim=-1)
+        query = torch.cat((q_nope, q_rope), dim=-1)
+        return query, key, value
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        query, key, value = self._project(x)
+        attended = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=True,
+        )
+        attended = attended.transpose(1, 2).contiguous().flatten(2)
+        return self.resid_dropout(self.output(attended))
+
+    def forward_selected(
+        self, normalized_x: torch.Tensor, active: torch.Tensor
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Keep every token as KV context while computing only active queries."""
+        query, key, value = self._project(normalized_x)
+        seq_len = normalized_x.shape[1]
+        key_positions = torch.arange(seq_len, device=normalized_x.device)
+        selected_outputs, selected_indices = [], []
+        for batch_index in range(normalized_x.shape[0]):
+            indices = active[batch_index].nonzero(as_tuple=False).flatten()
+            selected_indices.append(indices)
+            if indices.numel() == 0:
+                selected_outputs.append(
+                    normalized_x.new_empty((0, self.n_heads * self.value_dim))
+                )
+                continue
+            mask = key_positions[None, :] <= indices[:, None]
+            attended = F.scaled_dot_product_attention(
+                query[batch_index : batch_index + 1, :, indices],
+                key[batch_index : batch_index + 1],
+                value[batch_index : batch_index + 1],
+                attn_mask=mask[None, None],
+                dropout_p=0.0,
+                is_causal=False,
+            )
+            attended = attended.transpose(1, 2).contiguous().flatten(2)[0]
+            selected_outputs.append(self.resid_dropout(self.output(attended)))
+        return selected_outputs, selected_indices
+
+
 class MLP(nn.Module):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
@@ -118,13 +261,92 @@ class MLP(nn.Module):
         return self.network(x)
 
 
+class SparseMoE(nn.Module):
+    """Fine-grained top-k FFN experts with DeepSeek-style routing biases."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.num_experts = config.moe_num_experts
+        self.top_k = config.moe_top_k
+        expert_config = replace(config, d_ff=config.moe_expert_d_ff, model_type="dense")
+        self.experts = nn.ModuleList([MLP(expert_config) for _ in range(self.num_experts)])
+        self.router = nn.Linear(config.d_model, self.num_experts, bias=False)
+        self.register_buffer("selection_bias", torch.zeros(self.num_experts))
+        self.last_aux_loss: Optional[torch.Tensor] = None
+        self.last_entropy: Optional[torch.Tensor] = None
+        self.last_utilization: Optional[torch.Tensor] = None
+        self.last_affinity: Optional[torch.Tensor] = None
+
+    def clear_stats(self, reference: torch.Tensor) -> None:
+        zero = reference.sum() * 0.0
+        self.last_aux_loss = zero
+        self.last_entropy = zero
+        self.last_utilization = reference.new_zeros(self.num_experts)
+        self.last_affinity = reference.new_zeros(self.num_experts)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        original_shape = x.shape
+        flat = x.reshape(-1, original_shape[-1])
+        if flat.shape[0] == 0:
+            self.clear_stats(x)
+            return x
+        affinity = torch.sigmoid(self.router(flat))
+        selected = torch.topk(
+            affinity + self.selection_bias.to(affinity.dtype), self.top_k, dim=-1
+        ).indices
+        selected_affinity = affinity.gather(-1, selected)
+        weights = selected_affinity / selected_affinity.sum(dim=-1, keepdim=True).clamp_min(
+            torch.finfo(selected_affinity.dtype).eps
+        )
+        output = torch.zeros_like(flat)
+        for expert_index, expert in enumerate(self.experts):
+            token_index, slot_index = (selected == expert_index).nonzero(as_tuple=True)
+            if token_index.numel() == 0:
+                continue
+            contribution = expert(flat[token_index]) * weights[token_index, slot_index, None]
+            output.index_add_(0, token_index, contribution)
+
+        assignments = F.one_hot(selected, self.num_experts).float().sum(dim=1)
+        utilization = assignments.mean(dim=0) / float(self.top_k)
+        normalized_affinity = affinity / affinity.sum(dim=-1, keepdim=True).clamp_min(
+            torch.finfo(affinity.dtype).eps
+        )
+        mean_affinity = normalized_affinity.mean(dim=0)
+        frequency = assignments.mean(dim=0) * (self.num_experts / float(self.top_k))
+        self.last_aux_loss = (frequency * mean_affinity).sum()
+        self.last_entropy = -(
+            normalized_affinity * normalized_affinity.clamp_min(1e-9).log()
+        ).sum(dim=-1).mean()
+        self.last_utilization = utilization.detach()
+        self.last_affinity = mean_affinity.detach()
+        return output.reshape(original_shape)
+
+    @torch.no_grad()
+    def update_selection_bias(self, speed: float) -> None:
+        if speed <= 0 or self.last_utilization is None:
+            return
+        target = self.last_utilization.new_full(
+            self.last_utilization.shape, 1.0 / self.num_experts
+        )
+        self.selection_bias.add_(speed * torch.sign(target - self.last_utilization))
+        self.selection_bias.sub_(self.selection_bias.mean())
+
+
 class TransformerBlock(nn.Module):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         self.ln1 = nn.LayerNorm(config.d_model)
-        self.attn = CausalSelfAttention(config)
+        self.attn = (
+            MultiHeadLatentAttention(config)
+            if config.attention_type == "mla"
+            else CausalSelfAttention(config)
+        )
         self.ln2 = nn.LayerNorm(config.d_model)
-        self.mlp = MLP(config)
+        self.mlp = (
+            SparseMoE(config)
+            if config.model_type in {"sparse_moe_mtp", "sparse_moe_mtp_mla"}
+            else MLP(config)
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = x + self.attn(self.ln1(x))
@@ -134,14 +356,25 @@ class TransformerBlock(nn.Module):
         """Paper-faithful sparse inference for a hard `[B, T]` mask."""
         selected_attention, selected_indices = self.attn.forward_selected(self.ln1(x), active)
         output = x.clone()
-        for batch_index, (attention, indices) in enumerate(
-            zip(selected_attention, selected_indices)
-        ):
-            if indices.numel() == 0:
-                continue
-            h = x[batch_index, indices] + attention
-            h = h + self.mlp(self.ln2(h))
-            output[batch_index, indices] = h
+        hidden = [
+            x[batch_index, indices] + attention
+            for batch_index, (attention, indices) in enumerate(
+                zip(selected_attention, selected_indices)
+            )
+            if indices.numel() > 0
+        ]
+        if not hidden:
+            if isinstance(self.mlp, SparseMoE):
+                self.mlp.clear_stats(x)
+            return output
+        transformed = torch.cat(hidden, dim=0)
+        transformed = transformed + self.mlp(self.ln2(transformed))
+        offset = 0
+        for batch_index, indices in enumerate(selected_indices):
+            count = indices.numel()
+            if count:
+                output[batch_index, indices] = transformed[offset : offset + count]
+                offset += count
         return output
 
 
@@ -154,7 +387,10 @@ class TransformerBase(nn.Module):
         super().__init__()
         self.config = config
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.position_embedding = nn.Embedding(config.context_length, config.d_model)
+        self.position_embedding = (
+            nn.Embedding(config.context_length, config.d_model)
+            if config.position_embedding_type == "learned" else None
+        )
         self.embedding_dropout = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList([TransformerBlock(config) for _ in range(config.n_layers)])
         self.final_norm = nn.LayerNorm(config.d_model)
@@ -175,10 +411,11 @@ class TransformerBase(nn.Module):
     def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
         if token_ids.shape[1] > self.config.context_length:
             raise ValueError("Sequence is longer than context_length")
-        positions = torch.arange(token_ids.shape[1], device=token_ids.device)
-        return self.embedding_dropout(
-            self.token_embedding(token_ids) + self.position_embedding(positions)[None]
-        )
+        embedded = self.token_embedding(token_ids)
+        if self.position_embedding is not None:
+            positions = torch.arange(token_ids.shape[1], device=token_ids.device)
+            embedded = embedded + self.position_embedding(positions)[None]
+        return self.embedding_dropout(embedded)
 
     def finish(self, x: torch.Tensor, targets: Optional[torch.Tensor], **routing) -> ModelOutput:
         logits = self.lm_head(self.final_norm(x))
@@ -187,7 +424,10 @@ class TransformerBase(nn.Module):
         if targets is not None:
             token_losses = F.cross_entropy(logits.transpose(1, 2), targets, reduction="none")
             loss = token_losses.mean()
-        return ModelOutput(logits=logits, lm_loss=loss, token_losses=token_losses, **routing)
+        return ModelOutput(
+            logits=logits, lm_loss=loss, token_losses=token_losses,
+            hidden_states=x, **routing
+        )
 
     def parameter_count(self) -> int:
         return sum(parameter.numel() for parameter in self.parameters())
@@ -250,6 +490,8 @@ class SparseDepthTransformer(TransformerBase):
         state = router.initial_state(x) if self.config.router_type == "gru" else None
         soft_gates, hard_gates, chosen_actions = [], [], []
         log_probs, behavior_log_probs, entropies, logits_by_layer = [], [], [], []
+        moe_aux_losses, moe_entropies = [], []
+        expert_utilization, expert_affinity = [], []
         used_depth = torch.zeros(
             token_ids.shape, device=token_ids.device, dtype=torch.float32
         )
@@ -316,6 +558,11 @@ class SparseDepthTransformer(TransformerBase):
             else:
                 candidate = block(x)
                 x = apply_block_gate(x, candidate, gate.unsqueeze(-1))
+            if isinstance(block.mlp, SparseMoE):
+                moe_aux_losses.append(block.mlp.last_aux_loss)
+                moe_entropies.append(block.mlp.last_entropy)
+                expert_utilization.append(block.mlp.last_utilization)
+                expert_affinity.append(block.mlp.last_affinity)
             soft_gates.append(soft)
             hard_gates.append(gate)
             chosen_actions.append(chosen)
@@ -333,7 +580,87 @@ class SparseDepthTransformer(TransformerBase):
             behavior_log_probs=torch.stack(behavior_log_probs, dim=-1),
             routing_entropy=torch.stack(entropies, dim=-1),
             route_logits=torch.stack(logits_by_layer, dim=2),
+            moe_aux_loss=(
+                torch.stack(moe_aux_losses).mean() if moe_aux_losses else None
+            ),
+            moe_router_entropy=(
+                torch.stack(moe_entropies).mean() if moe_entropies else None
+            ),
+            expert_utilization=(
+                torch.stack(expert_utilization) if expert_utilization else None
+            ),
+            expert_affinity=(
+                torch.stack(expert_affinity) if expert_affinity else None
+            ),
         )
+
+
+class SparseMoEMTPTransformer(SparseDepthTransformer):
+    """SkipLayer with sparse FFNs, optional MLA+RoPE, and one MTP depth."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__(config)
+        dense_config = replace(config, model_type="dense")
+        self.mtp_hidden_norm = nn.LayerNorm(config.d_model)
+        self.mtp_token_norm = nn.LayerNorm(config.d_model)
+        self.mtp_projection = nn.Linear(2 * config.d_model, config.d_model, bias=False)
+        self.mtp_block = TransformerBlock(dense_config)
+        self.mtp_output_norm = nn.LayerNorm(config.d_model)
+        self.mtp_projection.apply(self._init_weights)
+        self.mtp_block.apply(self._init_weights)
+
+    def update_moe_selection_biases(self) -> None:
+        for block in self.blocks:
+            if isinstance(block.mlp, SparseMoE):
+                block.mlp.update_selection_bias(self.config.moe_bias_update_speed)
+
+    def mtp_draft_logits(
+        self,
+        token_ids: torch.Tensor,
+        main_hidden_states: torch.Tensor,
+        proposed_next_token: torch.Tensor,
+    ) -> torch.Tensor:
+        """Draft the token after ``proposed_next_token`` with the one-block MTP head.
+
+        ``main_hidden_states`` must be the full-model states for ``token_ids``.
+        The shifted observed tokens preserve the MTP module's complete causal chain.
+        """
+        if token_ids.ndim != 2 or main_hidden_states.shape[:2] != token_ids.shape:
+            raise ValueError("token_ids and main_hidden_states must share [batch, sequence]")
+        if proposed_next_token.shape not in {
+            (token_ids.shape[0],), (token_ids.shape[0], 1)
+        }:
+            raise ValueError("proposed_next_token must have shape [batch] or [batch, 1]")
+        proposed_next_token = proposed_next_token.reshape(token_ids.shape[0], 1)
+        following_tokens = torch.cat((token_ids[:, 1:], proposed_next_token), dim=1)
+        main_hidden = self.mtp_hidden_norm(main_hidden_states)
+        next_token = self.mtp_token_norm(self.token_embedding(following_tokens))
+        fused = self.mtp_projection(torch.cat((main_hidden, next_token), dim=-1))
+        mtp_hidden = self.mtp_block(fused)
+        return self.lm_head(self.mtp_output_norm(mtp_hidden))[:, -1]
+
+    def forward(
+        self,
+        token_ids: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        compute_mtp: bool = True,
+        **routing,
+    ) -> ModelOutput:
+        output = super().forward(token_ids, targets, **routing)
+        if targets is None or not compute_mtp or targets.shape[1] < 2:
+            return output
+        main_hidden = self.mtp_hidden_norm(output.hidden_states[:, :-1])
+        next_token = self.mtp_token_norm(self.token_embedding(targets[:, :-1]))
+        fused = self.mtp_projection(torch.cat((main_hidden, next_token), dim=-1))
+        mtp_hidden = self.mtp_block(fused)
+        mtp_logits = self.lm_head(self.mtp_output_norm(mtp_hidden))
+        mtp_targets = targets[:, 1:]
+        output.mtp_logits = mtp_logits
+        output.mtp_loss = F.cross_entropy(
+            mtp_logits.transpose(1, 2), mtp_targets
+        )
+        output.mtp_accuracy = mtp_logits.argmax(dim=-1).eq(mtp_targets).float().mean()
+        return output
 
 
 class MixtureOfRecursionsTransformer(TransformerBase):
@@ -867,4 +1194,6 @@ def build_model(config: ModelConfig) -> TransformerBase:
         return MixtureOfRecursionsTransformer(config)
     if config.model_type == "mor_skip":
         return MixtureOfRecursionsSkipLayerTransformer(config)
+    if config.model_type in {"sparse_moe_mtp", "sparse_moe_mtp_mla"}:
+        return SparseMoEMTPTransformer(config)
     return SparseDepthTransformer(config)

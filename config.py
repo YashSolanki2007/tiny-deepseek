@@ -33,6 +33,20 @@ class ModelConfig:
     mor_aux_loss_coefficient: float = 0.001
     mor_capacity_warmup_steps: int = 0
     mor_recursion_wise_kv: bool = True
+    moe_num_experts: int = 10
+    moe_top_k: int = 2
+    moe_expert_d_ff: int = 0
+    moe_bias_update_speed: float = 0.001
+    moe_aux_loss_coefficient: float = 0.0001
+    mtp_loss_coefficient: float = 0.3
+    attention_type: str = "mha"
+    position_embedding_type: str = "learned"
+    mla_q_lora_rank: int = 0
+    mla_kv_lora_rank: int = 0
+    mla_qk_nope_head_dim: int = 0
+    mla_qk_rope_head_dim: int = 0
+    mla_v_head_dim: int = 0
+    rope_theta: float = 10_000.0
 
     def __post_init__(self) -> None:
         if self.model_type == "dynamic":
@@ -41,12 +55,54 @@ class ModelConfig:
             self.router_type = "linear"
         if self.d_model % self.n_heads:
             raise ValueError("d_model must be divisible by n_heads")
-        if self.model_type not in {"dense", "sparse", "mor", "mor_skip"}:
-            raise ValueError("model_type must be dense, sparse, mor, or mor_skip")
+        if self.model_type not in {
+            "dense", "sparse", "mor", "mor_skip", "sparse_moe_mtp",
+            "sparse_moe_mtp_mla",
+        }:
+            raise ValueError(
+                "model_type must be dense, sparse, mor, mor_skip, sparse_moe_mtp, "
+                "or sparse_moe_mtp_mla"
+            )
         if self.router_type not in {"linear", "gru"}:
             raise ValueError("router_type must be linear or gru")
         if not 0 < self.initial_execute_probability < 1:
             raise ValueError("initial_execute_probability must be in (0, 1)")
+        if self.model_type == "sparse_moe_mtp_mla":
+            self.attention_type = "mla"
+            self.position_embedding_type = "rope"
+        if self.attention_type not in {"mha", "mla"}:
+            raise ValueError("attention_type must be mha or mla")
+        if self.position_embedding_type not in {"learned", "rope"}:
+            raise ValueError("position_embedding_type must be learned or rope")
+        if self.attention_type == "mla":
+            head_dim = self.d_model // self.n_heads
+            if self.mla_qk_rope_head_dim <= 0:
+                self.mla_qk_rope_head_dim = head_dim // 2
+            if self.mla_qk_nope_head_dim <= 0:
+                self.mla_qk_nope_head_dim = head_dim - self.mla_qk_rope_head_dim
+            if self.mla_v_head_dim <= 0:
+                self.mla_v_head_dim = head_dim
+            if self.mla_kv_lora_rank <= 0:
+                self.mla_kv_lora_rank = max(4, self.d_model // 4)
+            if self.mla_qk_rope_head_dim % 2:
+                raise ValueError("mla_qk_rope_head_dim must be even for RoPE")
+            if self.mla_qk_nope_head_dim <= 0 or self.mla_v_head_dim <= 0:
+                raise ValueError("MLA head dimensions must be positive")
+            if self.rope_theta <= 0:
+                raise ValueError("rope_theta must be positive")
+        if self.model_type in {"sparse_moe_mtp", "sparse_moe_mtp_mla"}:
+            if self.moe_num_experts < 2:
+                raise ValueError("moe_num_experts must be at least 2")
+            if not 1 <= self.moe_top_k <= self.moe_num_experts:
+                raise ValueError("moe_top_k must lie in [1, moe_num_experts]")
+            if self.moe_expert_d_ff <= 0:
+                if self.d_ff % self.moe_top_k:
+                    raise ValueError("d_ff must be divisible by moe_top_k")
+                self.moe_expert_d_ff = self.d_ff // self.moe_top_k
+            if self.moe_bias_update_speed < 0:
+                raise ValueError("moe_bias_update_speed must be non-negative")
+            if self.moe_aux_loss_coefficient < 0 or self.mtp_loss_coefficient < 0:
+                raise ValueError("MoE and MTP loss coefficients must be non-negative")
         self.mor_capacity_factors = tuple(float(value) for value in self.mor_capacity_factors)
         if self.model_type in {"mor", "mor_skip"}:
             expected_layers = 2 + self.recursion_steps * self.recursion_block_layers

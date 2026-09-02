@@ -87,7 +87,13 @@ def main() -> None:
         print(f"Estimated block utilization: {100 * fraction:.2f}%")
         print(f"Estimated block skipping: {100 * (1 - fraction):.2f}%")
         print("Per-layer utilization: " + " ".join(f"{x:.3f}" for x in per_layer.tolist()))
-    print("Note: Stage A evaluates every block; utilization is theoretical, not a wall-clock saving.")
+    if model.config.sparse_inference:
+        print(
+            "Note: greedy inference executes selected queries/FFNs only; FLOP utilization "
+            "is analytical and should still be checked against measured latency."
+        )
+    else:
+        print("Note: Stage A evaluates every block; utilization is theoretical, not a wall-clock saving.")
 
 
 if __name__ == "__main__":

@@ -32,6 +32,11 @@ COLUMNS = [
     "skip_density_budgets", "mean_conditional_skip_density",
     "skip_conditional_utilization", "skip_soft_conditional_utilization",
     "combined_block_utilization", "source_mor_checkpoint",
+    "mtp_loss", "mtp_accuracy", "moe_num_experts", "moe_top_k",
+    "moe_aux_loss", "moe_router_entropy", "expert_utilization_min",
+    "expert_utilization_max", "expert_utilization_cv", "source_checkpoint",
+    "attention_type", "position_embedding_type", "mla_kv_lora_rank",
+    "mla_qk_nope_head_dim", "mla_qk_rope_head_dim", "mla_v_head_dim",
 ]
 GROUP_KEYS = ["model", "router_type", "training_method", "target_density", "lambda_density", "lambda_grpo"]
 METRICS = [

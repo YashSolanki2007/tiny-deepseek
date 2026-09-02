@@ -19,9 +19,11 @@ from evaluation import evaluate_model
 from generate import generate_tokens
 from utils import (
     estimate_dense_block_flops,
+    estimate_mla_skiplayer_moe_mtp_flops,
     estimate_mor_flops,
     estimate_mor_skip_flops,
     estimate_skiplayer_flops,
+    estimate_sparse_moe_mtp_flops,
     load_checkpoint,
     select_device,
     write_json,
@@ -64,6 +66,18 @@ def evaluate_checkpoint(
                 metrics["recursion_utilization"],
                 metrics["combined_block_utilization"],
             )
+        elif model.config.model_type == "sparse_moe_mtp_mla":
+            estimated_flops = estimate_mla_skiplayer_moe_mtp_flops(
+                model.config,
+                model.config.context_length,
+                metrics["compute_fraction"],
+            )
+        elif model.config.model_type == "sparse_moe_mtp":
+            estimated_flops = estimate_sparse_moe_mtp_flops(
+                model.config,
+                model.config.context_length,
+                metrics["compute_fraction"],
+            )
         else:
             estimated_flops = estimate_skiplayer_flops(
                 model.config,
@@ -92,7 +106,9 @@ def evaluate_checkpoint(
     (samples_dir / "evaluation_sample.txt").write_text(sample + "\n", encoding="utf-8")
     plots = experiment_dir / "plots"
     save_difficulty_plot(difficulty, plots / "difficulty_vs_depth")
-    if model.config.model_type in {"sparse", "mor", "mor_skip"}:
+    if model.config.model_type in {
+        "sparse", "sparse_moe_mtp", "sparse_moe_mtp_mla", "mor", "mor_skip"
+    }:
         routing_dir = experiment_dir / "routing_visualizations"
         text = "ROMEO:\nWhat light through yonder window breaks?"
         save_routing_heatmap(model, dataset.stoi, text, "soft", routing_dir / "routing_soft.png")
@@ -104,7 +120,27 @@ def evaluate_checkpoint(
     summary_path = experiment_dir / "summary.json"
     summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
     summary.update(metrics)
-    if model.config.model_type == "sparse":
+    if model.config.model_type in {"sparse_moe_mtp", "sparse_moe_mtp_mla"}:
+        summary.update(
+            {
+                "moe_num_experts": model.config.moe_num_experts,
+                "moe_top_k": model.config.moe_top_k,
+                "moe_expert_d_ff": model.config.moe_expert_d_ff,
+                "mtp_prediction_depth": 1,
+                "mtp_loss_coefficient": model.config.mtp_loss_coefficient,
+                "moe_aux_loss_coefficient": model.config.moe_aux_loss_coefficient,
+                "moe_bias_update_speed": model.config.moe_bias_update_speed,
+                "attention_type": model.config.attention_type,
+                "position_embedding_type": model.config.position_embedding_type,
+                "mla_kv_lora_rank": model.config.mla_kv_lora_rank,
+                "mla_qk_nope_head_dim": model.config.mla_qk_nope_head_dim,
+                "mla_qk_rope_head_dim": model.config.mla_qk_rope_head_dim,
+                "mla_v_head_dim": model.config.mla_v_head_dim,
+            }
+        )
+    if model.config.model_type in {
+        "sparse", "sparse_moe_mtp", "sparse_moe_mtp_mla"
+    }:
         block_parameters = sum(
             parameter.numel()
             for block in model.blocks
@@ -114,11 +150,36 @@ def evaluate_checkpoint(
             parameter.numel() for parameter in model.router.parameters()
         )
         always_active = model.parameter_count() - block_parameters - router_parameters
-        summary["active_parameter_estimate"] = (
-            always_active
-            + router_parameters
-            + metrics["compute_fraction"] * block_parameters
-        )
+        if model.config.model_type in {"sparse_moe_mtp", "sparse_moe_mtp_mla"}:
+            mtp_parameters = sum(
+                parameter.numel()
+                for module in (
+                    model.mtp_hidden_norm, model.mtp_token_norm, model.mtp_projection,
+                    model.mtp_block, model.mtp_output_norm,
+                )
+                for parameter in module.parameters()
+            )
+            always_active -= mtp_parameters
+            expert_parameters = sum(
+                parameter.numel()
+                for block in model.blocks
+                for expert in block.mlp.experts
+                for parameter in expert.parameters()
+            )
+            non_expert_blocks = block_parameters - expert_parameters
+            active_expert_fraction = model.config.moe_top_k / model.config.moe_num_experts
+            summary["active_parameter_estimate"] = (
+                always_active + router_parameters
+                + metrics["compute_fraction"]
+                * (non_expert_blocks + active_expert_fraction * expert_parameters)
+            )
+            summary["inference_parameter_count"] = model.parameter_count() - mtp_parameters
+        else:
+            summary["active_parameter_estimate"] = (
+                always_active
+                + router_parameters
+                + metrics["compute_fraction"] * block_parameters
+            )
     elif model.config.model_type in {"mor", "mor_skip"}:
         summary["active_parameter_estimate"] = model.parameter_count()
     summary["checkpoint"] = str(checkpoint_path)

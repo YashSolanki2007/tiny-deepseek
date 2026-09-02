@@ -18,7 +18,9 @@ def display_character(character: str) -> str:
 
 @torch.inference_mode()
 def save_routing_heatmap(model, stoi, text: str, mode: str, output_path: str | Path) -> Path:
-    if model.config.model_type not in {"sparse", "mor", "mor_skip"}:
+    if model.config.model_type not in {
+        "sparse", "sparse_moe_mtp", "sparse_moe_mtp_mla", "mor", "mor_skip"
+    }:
         raise ValueError("Routing visualization requires a routed checkpoint")
     unknown = sorted(set(text) - stoi.keys())
     if unknown:

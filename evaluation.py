@@ -36,6 +36,13 @@ def evaluate_model(
         "compute_fraction": 0.0,
         "skip_fraction": 0.0,
         "routing_entropy": 0.0,
+        "mtp_loss": 0.0,
+        "mtp_accuracy": 0.0,
+        "moe_aux_loss": 0.0,
+        "moe_router_entropy": 0.0,
+        "expert_utilization_min": 0.0,
+        "expert_utilization_max": 0.0,
+        "expert_utilization_cv": 0.0,
     }
     hard_layers = torch.zeros(model.config.n_layers)
     soft_layers = torch.zeros(model.config.n_layers)
@@ -51,6 +58,11 @@ def evaluate_model(
     )
     skip_soft_conditional = torch.zeros_like(skip_conditional) if skip_conditional is not None else None
     combined_blocks = torch.zeros_like(skip_conditional) if skip_conditional is not None else None
+    expert_layers = (
+        torch.zeros(model.config.n_layers, model.config.moe_num_experts)
+        if model.config.model_type in {"sparse_moe_mtp", "sparse_moe_mtp_mla"} else None
+    )
+    expert_affinity = torch.zeros_like(expert_layers) if expert_layers is not None else None
     generator = torch.Generator().manual_seed(eval_seed)
     synchronize_device(device)
     started = time.perf_counter()
@@ -78,6 +90,11 @@ def evaluate_model(
             "routing_entropy",
         ):
             totals[key] += route[key]
+        for key in (
+            "mtp_loss", "mtp_accuracy", "moe_aux_loss", "moe_router_entropy",
+            "expert_utilization_min", "expert_utilization_max", "expert_utilization_cv",
+        ):
+            totals[key] += route.get(key, 0.0)
         hard_layers += torch.tensor(route["layer_utilization"])
         soft_layers += torch.tensor(route["layer_soft_probability"])
         if recursion_layers is not None:
@@ -91,6 +108,9 @@ def evaluate_model(
                 route["skip_soft_conditional_utilization"]
             )
             combined_blocks += torch.tensor(route["combined_block_utilization"])
+        if expert_layers is not None:
+            expert_layers += torch.tensor(route["expert_utilization"])
+            expert_affinity += torch.tensor(route["expert_affinity"])
     synchronize_device(device)
     elapsed = time.perf_counter() - started
     for key in totals:
@@ -120,6 +140,15 @@ def evaluate_model(
         totals["mean_conditional_skip_density"] = float(
             (skip_conditional / eval_iters).mean().item()
         )
+    if expert_layers is not None:
+        totals["expert_utilization"] = (expert_layers / eval_iters).tolist()
+        totals["expert_affinity"] = (expert_affinity / eval_iters).tolist()
+    else:
+        for key in (
+            "mtp_loss", "mtp_accuracy", "moe_aux_loss", "moe_router_entropy",
+            "expert_utilization_min", "expert_utilization_max", "expert_utilization_cv",
+        ):
+            totals.pop(key, None)
     if was_training:
         model.train()
     return totals

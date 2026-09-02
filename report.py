@@ -59,6 +59,12 @@ def model_label(row: dict[str, Any]) -> str:
             if row.get("training_method") == "grpo"
             else "MoR + SkipLayer"
         )
+    if row.get("model") in {"sparse_moe_mtp", "sparse_moe_mtp_mla"}:
+        return (
+            "SkipLayer + GRPO + MoE + MTP"
+            if row.get("training_method") == "grpo"
+            else "SkipLayer + MoE + MTP adaptation"
+        )
     if row.get("model") == "sparse" and row.get("paper_reproduction"):
         return "SkipLayer + GRPO" if row.get("training_method") == "grpo" else "SkipLayer"
     router = str(row.get("router_type", "unknown")).upper()

@@ -97,6 +97,26 @@ def routing_metrics(output: ModelOutput, n_layers: int) -> Dict[str, Any]:
         metrics["mean_conditional_skip_density"] = float(
             output.skip_conditional_utilization.detach().float().mean().item()
         )
+    if output.moe_aux_loss is not None:
+        utilization = output.expert_utilization.detach().float().cpu()
+        affinity = output.expert_affinity.detach().float().cpu()
+        metrics.update(
+            {
+                "moe_aux_loss": float(output.moe_aux_loss.detach().item()),
+                "moe_router_entropy": float(output.moe_router_entropy.detach().item()),
+                "expert_utilization": utilization.tolist(),
+                "expert_affinity": affinity.tolist(),
+                "expert_utilization_min": float(utilization.min().item()),
+                "expert_utilization_max": float(utilization.max().item()),
+                "expert_utilization_cv": float(
+                    utilization.std(unbiased=False).item()
+                    / max(utilization.mean().item(), 1e-9)
+                ),
+            }
+        )
+    if output.mtp_loss is not None:
+        metrics["mtp_loss"] = float(output.mtp_loss.detach().item())
+        metrics["mtp_accuracy"] = float(output.mtp_accuracy.detach().item())
     return metrics
 
 
@@ -134,6 +154,57 @@ def estimate_skiplayer_flops(
     return float(
         config.n_layers
         * (key_value + active_query_output + active_attention + active_ffn + router)
+    )
+
+
+def estimate_sparse_moe_mtp_flops(
+    config: ModelConfig, seq_len: int, density: float
+) -> float:
+    """Inference FLOPs for SkipLayer+MoE; the training-only MTP head is discarded."""
+    base = estimate_skiplayer_flops(config, seq_len, density)
+    expert_router = (
+        2
+        * config.n_layers
+        * float(density)
+        * seq_len
+        * config.d_model
+        * config.moe_num_experts
+    )
+    return float(base + expert_router)
+
+
+def estimate_mla_skiplayer_moe_mtp_flops(
+    config: ModelConfig, seq_len: int, density: float
+) -> float:
+    """Inference FLOPs for latent-KV attention, SkipLayer, and sparse experts."""
+    d, heads, length, active = (
+        config.d_model, config.n_heads, float(seq_len), float(density)
+    )
+    qk = config.mla_qk_nope_head_dim + config.mla_qk_rope_head_dim
+    value = config.mla_v_head_dim
+    rank = config.mla_kv_lora_rank
+    if config.mla_q_lora_rank > 0:
+        query = 2 * active * length * (
+            d * config.mla_q_lora_rank
+            + config.mla_q_lora_rank * heads * qk
+        )
+    else:
+        query = 2 * active * length * d * heads * qk
+    kv_down = 2 * length * d * (rank + config.mla_qk_rope_head_dim)
+    kv_up = 2 * length * rank * heads * (
+        config.mla_qk_nope_head_dim + value
+    )
+    attention = 2 * active * length * length * heads * (qk + value)
+    output = 2 * active * length * heads * value * d
+    feed_forward = 4 * active * length * d * config.d_ff
+    skip_router = 4 * length * d
+    expert_router = 2 * active * length * d * config.moe_num_experts
+    return float(
+        config.n_layers
+        * (
+            query + kv_down + kv_up + attention + output
+            + feed_forward + skip_router + expert_router
+        )
     )
 
 
