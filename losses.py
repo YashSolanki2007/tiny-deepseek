@@ -66,8 +66,13 @@ def grpo_reward(
 
 
 def group_relative_advantages(rewards: torch.Tensor, epsilon: float = 1e-6) -> torch.Tensor:
+    """Normalize rewards within each group, returning zero for tied groups."""
     centered = rewards - rewards.mean(dim=1, keepdim=True)
-    return centered / (rewards.std(dim=1, keepdim=True, unbiased=False) + epsilon)
+    standard_deviation = rewards.std(dim=1, keepdim=True, unbiased=False)
+    normalized = centered / standard_deviation.clamp_min(epsilon)
+    return torch.where(
+        standard_deviation > epsilon, normalized, torch.zeros_like(normalized)
+    )
 
 
 def clipped_grpo_loss(

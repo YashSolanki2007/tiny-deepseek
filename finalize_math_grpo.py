@@ -19,15 +19,18 @@ from utils import load_checkpoint, select_device, write_json
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--checkpoint", default="experiments/math_grpo_seed42/grpo/checkpoints/latest.pt"
+        "--checkpoint",
+        default="experiments/math_v2_seed42/grpo/checkpoints/latest.pt",
     )
     parser.add_argument(
         "--supervised-checkpoint",
-        default="experiments/math_grpo_seed42/supervised/checkpoints/best_val_loss.pt",
+        default="experiments/math_v2_seed42/supervised/checkpoints/best_val_loss.pt",
     )
-    parser.add_argument("--supervised-dir", default="experiments/math_grpo_seed42/supervised")
-    parser.add_argument("--grpo-dir", default="experiments/math_grpo_seed42/grpo")
-    parser.add_argument("--results-dir", default="results/math_grpo_seed42")
+    parser.add_argument(
+        "--supervised-dir", default="experiments/math_v2_seed42/supervised"
+    )
+    parser.add_argument("--grpo-dir", default="experiments/math_v2_seed42/grpo")
+    parser.add_argument("--results-dir", default="results/math_v2_seed42")
     parser.add_argument("--data-dir", default="data/gsm8k")
     parser.add_argument("--answer-examples", type=int, default=6)
     parser.add_argument("--answer-tokens", type=int, default=48)
@@ -39,14 +42,25 @@ def main() -> None:
     model, grpo_checkpoint = load_checkpoint(args.checkpoint, device)
     if not isinstance(model, SparseMoEMTPTransformer):
         raise ValueError("expected the trained math MLA+RoPE MoE+MTP model")
-    data = MathData(args.data_dir, model.config.context_length, seed=args.seed)
+    dataset_config = grpo_checkpoint.get("training_config", {}).get("dataset", {})
+    if not dataset_config:
+        dataset_config = grpo_checkpoint.get("training_config", {}).get(
+            "source_dataset", {}
+        )
+    data = MathData(
+        args.data_dir,
+        model.config.context_length,
+        seed=args.seed,
+        tokenizer_type=dataset_config.get("tokenizer_type", "byte"),
+        bpe_vocab_size=int(dataset_config.get("bpe_vocab_size", 4096)),
+    )
     validation = evaluate_math_model(model, data, device, batch_size=2, eval_iters=4)
     answers, samples = evaluate_math_answers(
         model, data, device, split="test", count=args.answer_examples,
         max_new_tokens=args.answer_tokens, seed=args.seed + 1,
     )
     grpo_summary = {
-        "stage": "math_quality_grpo",
+        "stage": "math_binary_correctness_grpo",
         **validation,
         **answers,
         "samples": samples,
@@ -91,7 +105,7 @@ def main() -> None:
                     f"final/{key}", value, int(supervised_checkpoint["step"])
                 )
     result = {
-        "experiment": "larger MLA+RoPE SkipLayer+MoE+MTP math model with quality GRPO",
+        "experiment": "MLA+RoPE SkipLayer+MoE+MTP math model with binary GRPO",
         "supervised": supervised,
         "grpo": grpo_summary,
     }
@@ -102,7 +116,7 @@ def main() -> None:
         "| Stage | Validation CE | Byte accuracy | Exact answer | Parse rate | Layers/token | FLOPs vs dense |",
         "|---|---:|---:|---:|---:|---:|---:|",
     ]
-    for name, values in (("Supervised", supervised), ("Quality GRPO", grpo_summary)):
+    for name, values in (("Supervised", supervised), ("Binary GRPO", grpo_summary)):
         lines.append(
             f"| {name} | {values.get('val_loss', float('nan')):.4f} "
             f"| {100 * values.get('val_accuracy', 0):.2f}% "
@@ -123,7 +137,7 @@ def main() -> None:
                 f"Gold: `{sample['gold_answer']}`; supervised prediction: "
                 f"`{before['prediction']}`; GRPO prediction: `{sample['prediction']}`", "",
                 "Supervised:", "", "```text", before["completion"], "```", "",
-                "Quality GRPO:", "", "```text", sample["completion"], "```", "",
+                "Binary GRPO:", "", "```text", sample["completion"], "```", "",
             ]
         )
     results_dir.mkdir(parents=True, exist_ok=True)

@@ -66,6 +66,29 @@ def test_sparse_moe_mtp_outputs_and_expert_accounting() -> None:
     assert torch.isfinite(output.moe_aux_loss)
 
 
+def test_sparse_moe_mtp_supports_prompt_masked_targets() -> None:
+    config = tiny_config(
+        model_type="sparse_moe_mtp", router_type="linear",
+        moe_num_experts=4, moe_top_k=2,
+    )
+    model = build_model(config)
+    token_ids = torch.randint(0, config.vocab_size, (2, config.context_length))
+    targets = torch.roll(token_ids, shifts=-1, dims=1)
+    targets[:, :3] = -100
+    targets[:, -2:] = -100
+    actions = torch.ones(2, config.context_length, config.n_layers, dtype=torch.long)
+    output = model(
+        token_ids, targets, routing_mode="greedy", actions=actions
+    )
+    assert torch.isfinite(output.lm_loss)
+    assert torch.isfinite(output.mtp_loss)
+    assert output.hard_gates.eq(1).all()
+    expected = torch.nn.functional.cross_entropy(
+        output.logits.transpose(1, 2), targets
+    )
+    torch.testing.assert_close(output.lm_loss, expected)
+
+
 def test_sparse_moe_mtp_can_discard_training_only_mtp_module() -> None:
     config = tiny_config(model_type="sparse_moe_mtp", router_type="linear")
     model = build_model(config).eval()
@@ -89,6 +112,34 @@ def test_mla_variant_replaces_absolute_positions_and_runs_mtp() -> None:
     assert output.logits.shape == (2, config.context_length, config.vocab_size)
     assert output.mtp_logits.shape == (2, config.context_length - 1, config.vocab_size)
     assert torch.isfinite(output.logits).all()
+
+
+def test_mla_full_depth_kv_cache_matches_full_prefix_logits() -> None:
+    torch.manual_seed(17)
+    config = tiny_config(
+        model_type="sparse_moe_mtp_mla", router_type="linear",
+        moe_num_experts=4, moe_top_k=2,
+    )
+    model = build_model(config).eval()
+    prefix = torch.randint(0, config.vocab_size, (2, 5))
+    actions = torch.ones(2, 5, config.n_layers, dtype=torch.long)
+    full = model(prefix, routing_mode="greedy", actions=actions, compute_mtp=False)
+    cached_logits, caches = model.full_depth_prefill(prefix)
+    torch.testing.assert_close(cached_logits, full.logits[:, -1], rtol=2e-5, atol=2e-6)
+
+    next_token = torch.randint(0, config.vocab_size, (2, 1))
+    cached_next, _ = model.full_depth_decode(next_token, caches)
+    extended = torch.cat((prefix, next_token), dim=1)
+    extended_actions = torch.ones(2, 6, config.n_layers, dtype=torch.long)
+    full_next = model(
+        extended,
+        routing_mode="greedy",
+        actions=extended_actions,
+        compute_mtp=False,
+    )
+    torch.testing.assert_close(
+        cached_next, full_next.logits[:, -1], rtol=2e-5, atol=2e-6
+    )
 
 
 def test_mla_sparse_selected_queries_match_dense_masked_semantics() -> None:

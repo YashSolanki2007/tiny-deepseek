@@ -125,12 +125,19 @@ class RMSNorm(nn.Module):
         return normalized.to(x.dtype) * self.weight
 
 
-def apply_rotary_embedding(x: torch.Tensor, theta: float) -> torch.Tensor:
+def apply_rotary_embedding(
+    x: torch.Tensor, theta: float, position_offset: int = 0
+) -> torch.Tensor:
     """Apply interleaved RoPE to `[batch, heads, sequence, dimension]`."""
     dimension = x.shape[-1]
     if dimension % 2:
         raise ValueError("RoPE dimension must be even")
-    positions = torch.arange(x.shape[-2], device=x.device, dtype=torch.float32)
+    positions = torch.arange(
+        position_offset,
+        position_offset + x.shape[-2],
+        device=x.device,
+        dtype=torch.float32,
+    )
     inverse_frequency = 1.0 / (
         theta ** (torch.arange(0, dimension, 2, device=x.device).float() / dimension)
     )
@@ -182,7 +189,7 @@ class MultiHeadLatentAttention(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
 
     def _project(
-        self, x: torch.Tensor
+        self, x: torch.Tensor, position_offset: int = 0
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch, seq_len, _ = x.shape
         if self.q_rank > 0:
@@ -191,7 +198,7 @@ class MultiHeadLatentAttention(nn.Module):
             q = self.q_proj(x)
         q = q.view(batch, seq_len, self.n_heads, self.qk_dim).transpose(1, 2)
         q_nope, q_rope = q.split((self.nope_dim, self.rope_dim), dim=-1)
-        q_rope = apply_rotary_embedding(q_rope, self.theta)
+        q_rope = apply_rotary_embedding(q_rope, self.theta, position_offset)
 
         latent_and_rope = self.kv_down(x)
         latent, k_rope = latent_and_rope.split((self.kv_rank, self.rope_dim), dim=-1)
@@ -200,7 +207,7 @@ class MultiHeadLatentAttention(nn.Module):
             batch, seq_len, self.n_heads, self.nope_dim + self.value_dim
         ).transpose(1, 2)
         k_nope, value = expanded.split((self.nope_dim, self.value_dim), dim=-1)
-        k_rope = apply_rotary_embedding(k_rope[:, None], self.theta)
+        k_rope = apply_rotary_embedding(k_rope[:, None], self.theta, position_offset)
         key = torch.cat((k_nope, k_rope.expand(-1, self.n_heads, -1, -1)), dim=-1)
         query = torch.cat((q_nope, q_rope), dim=-1)
         return query, key, value
@@ -216,6 +223,29 @@ class MultiHeadLatentAttention(nn.Module):
         )
         attended = attended.transpose(1, 2).contiguous().flatten(2)
         return self.resid_dropout(self.output(attended))
+
+    def forward_cached(
+        self,
+        x: torch.Tensor,
+        cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """MLA forward with an inference KV cache for full-depth decoding."""
+        position_offset = 0 if cache is None else cache[0].shape[-2]
+        query, new_key, new_value = self._project(x, position_offset)
+        if cache is None:
+            key, value = new_key, new_value
+        else:
+            key = torch.cat((cache[0], new_key), dim=-2)
+            value = torch.cat((cache[1], new_value), dim=-2)
+        attended = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            dropout_p=0.0,
+            is_causal=cache is None and x.shape[1] > 1,
+        )
+        attended = attended.transpose(1, 2).contiguous().flatten(2)
+        return self.resid_dropout(self.output(attended)), (key, value)
 
     def forward_selected(
         self, normalized_x: torch.Tensor, active: torch.Tensor
@@ -352,6 +382,17 @@ class TransformerBlock(nn.Module):
         h = x + self.attn(self.ln1(x))
         return h + self.mlp(self.ln2(h))
 
+    def forward_cached(
+        self,
+        x: torch.Tensor,
+        cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        if not isinstance(self.attn, MultiHeadLatentAttention):
+            raise TypeError("cached decoding is currently implemented for MLA only")
+        attention, updated_cache = self.attn.forward_cached(self.ln1(x), cache)
+        h = x + attention
+        return h + self.mlp(self.ln2(h)), updated_cache
+
     def forward_selected(self, x: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
         """Paper-faithful sparse inference for a hard `[B, T]` mask."""
         selected_attention, selected_indices = self.attn.forward_selected(self.ln1(x), active)
@@ -423,7 +464,8 @@ class TransformerBase(nn.Module):
         loss = None
         if targets is not None:
             token_losses = F.cross_entropy(logits.transpose(1, 2), targets, reduction="none")
-            loss = token_losses.mean()
+            valid_targets = targets.ne(-100)
+            loss = token_losses.sum() / valid_targets.sum().clamp_min(1)
         return ModelOutput(
             logits=logits, lm_loss=loss, token_losses=token_losses,
             hidden_states=x, **routing
@@ -614,6 +656,38 @@ class SparseMoEMTPTransformer(SparseDepthTransformer):
             if isinstance(block.mlp, SparseMoE):
                 block.mlp.update_selection_bias(self.config.moe_bias_update_speed)
 
+    def full_depth_prefill(
+        self, token_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        """Prefill all MLA layers and return next-token logits plus KV caches."""
+        if self.config.attention_type != "mla":
+            raise TypeError("full-depth cached decoding requires MLA")
+        x = self.embed(token_ids)
+        caches = []
+        for block in self.blocks:
+            x, cache = block.forward_cached(x)
+            caches.append(cache)
+        logits = self.lm_head(self.final_norm(x[:, -1]))
+        return logits, caches
+
+    def full_depth_decode(
+        self,
+        next_token: torch.Tensor,
+        caches: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        """Decode one token through all layers and extend the MLA KV caches."""
+        if next_token.ndim == 1:
+            next_token = next_token[:, None]
+        if next_token.shape[1] != 1 or len(caches) != len(self.blocks):
+            raise ValueError("cached decode expects one token and one cache per layer")
+        x = self.embed(next_token)
+        updated = []
+        for block, cache in zip(self.blocks, caches):
+            x, new_cache = block.forward_cached(x, cache)
+            updated.append(new_cache)
+        logits = self.lm_head(self.final_norm(x[:, -1]))
+        return logits, updated
+
     def mtp_draft_logits(
         self,
         token_ids: torch.Tensor,
@@ -650,7 +724,9 @@ class SparseMoEMTPTransformer(SparseDepthTransformer):
         if targets is None or not compute_mtp or targets.shape[1] < 2:
             return output
         main_hidden = self.mtp_hidden_norm(output.hidden_states[:, :-1])
-        next_token = self.mtp_token_norm(self.token_embedding(targets[:, :-1]))
+        # Use the unmasked observed next tokens. Supervised targets may contain
+        # ignore_index=-100 over prompts and padding, which cannot be embedded.
+        next_token = self.mtp_token_norm(self.token_embedding(token_ids[:, 1:]))
         fused = self.mtp_projection(torch.cat((main_hidden, next_token), dim=-1))
         mtp_hidden = self.mtp_block(fused)
         mtp_logits = self.lm_head(self.mtp_output_norm(mtp_hidden))
@@ -659,7 +735,12 @@ class SparseMoEMTPTransformer(SparseDepthTransformer):
         output.mtp_loss = F.cross_entropy(
             mtp_logits.transpose(1, 2), mtp_targets
         )
-        output.mtp_accuracy = mtp_logits.argmax(dim=-1).eq(mtp_targets).float().mean()
+        valid_mtp = mtp_targets.ne(-100)
+        output.mtp_accuracy = (
+            mtp_logits.argmax(dim=-1).eq(mtp_targets)[valid_mtp].float().mean()
+            if bool(valid_mtp.any())
+            else mtp_logits.sum() * 0.0
+        )
         return output
 
 

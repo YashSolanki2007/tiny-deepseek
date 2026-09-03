@@ -121,7 +121,10 @@ def routing_metrics(output: ModelOutput, n_layers: int) -> Dict[str, Any]:
 
 
 def top1_accuracy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    return logits.argmax(dim=-1).eq(targets).float().mean()
+    valid = targets.ne(-100)
+    if not bool(valid.any()):
+        return logits.sum() * 0.0
+    return logits.argmax(dim=-1).eq(targets)[valid].float().mean()
 
 
 def gradient_norm(parameters: Iterable[torch.nn.Parameter]) -> float:

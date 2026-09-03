@@ -1,4 +1,4 @@
-"""Quality-focused token-policy GRPO for the math MLA+RoPE sparse model."""
+"""Binary-correctness token-policy GRPO for the math MLA+RoPE sparse model."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import torch.nn.functional as F
 
 from logging_utils import StructuredLogger
 from losses import group_relative_advantages
-from math_data import MathData
+from math_data import MathData, MathExample
 from math_training_utils import (
     evaluate_math_answers,
     evaluate_math_model,
@@ -36,8 +36,7 @@ from utils import (
 
 FIELDS = [
     "step", "split", "mean_reward", "reward_std", "best_reward", "worst_reward",
-    "exact_reward", "format_reward", "closeness_reward", "repetition_penalty",
-    "compute_violation", "group_exact_match", "group_parse_rate", "policy_loss",
+    "exact_reward", "group_exact_match", "group_parse_rate", "policy_loss",
     "kl_loss", "sft_loss", "mtp_loss", "moe_aux_loss", "total_loss",
     "mean_probability_ratio", "clip_fraction", "advantage_std", "learning_rate",
     "gradient_norm", "seconds_per_step", "rollout_tokens_per_second",
@@ -45,6 +44,7 @@ FIELDS = [
     "val_perplexity", "val_accuracy", "mtp_accuracy", "layers_per_token",
     "skip_fraction", "expert_utilization_cv", "estimated_flops_vs_full_dense",
     "answer_exact_match", "answer_parse_rate",
+    "curriculum_difficulty", "mixed_prompt_pool_size", "mixed_group",
 ]
 
 
@@ -52,26 +52,101 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument(
         "--checkpoint",
-        default="experiments/math_grpo_seed42/supervised/checkpoints/best_val_loss.pt",
+        default="experiments/math_v2_seed42/supervised/checkpoints/best_val_loss.pt",
     )
-    result.add_argument("--experiment-dir", default="experiments/math_grpo_seed42/grpo")
+    result.add_argument(
+        "--experiment-dir", default="experiments/math_v2_seed42/grpo"
+    )
     result.add_argument("--data-dir", default="data/gsm8k")
     result.add_argument("--device", default="auto")
-    result.add_argument("--max-steps", type=int, default=40)
-    result.add_argument("--group-size", type=int, default=4)
-    result.add_argument("--max-new-tokens", type=int, default=48)
+    result.add_argument("--max-steps", type=int, default=500)
+    result.add_argument("--group-size", type=int, default=16)
+    result.add_argument("--max-new-tokens", type=int, default=128)
     result.add_argument("--temperature", type=float, default=1.0)
     result.add_argument("--learning-rate", type=float, default=3e-6)
     result.add_argument("--clip-epsilon", type=float, default=0.2)
     result.add_argument("--beta-kl", type=float, default=0.04)
     result.add_argument("--sft-coefficient", type=float, default=0.5)
-    result.add_argument("--compute-target", type=float, default=0.70)
+    result.add_argument("--sft-batch-size", type=int, default=4)
+    result.add_argument(
+        "--prompt-screen-examples",
+        type=int,
+        default=128,
+        help="Training prompts screened with separate rollouts for mixed outcomes.",
+    )
     result.add_argument("--eval-interval", type=int, default=10)
     result.add_argument("--eval-iters", type=int, default=3)
     result.add_argument("--log-interval", type=int, default=1)
     result.add_argument("--answer-eval-examples", type=int, default=6)
     result.add_argument("--seed", type=int, default=42)
     return result
+
+
+@torch.inference_mode()
+def build_mixed_prompt_pool(
+    model: SparseMoEMTPTransformer,
+    data: MathData,
+    examples: list[MathExample],
+    *,
+    group_size: int,
+    max_new_tokens: int,
+    temperature: float,
+    device: torch.device,
+    count: int,
+    seed: int,
+) -> tuple[list[MathExample], list[dict[str, Any]]]:
+    """Screen prompts with rollouts that are separate from policy updates."""
+    candidates = list(examples)
+    random.Random(seed).shuffle(candidates)
+    selected = candidates[: min(count, len(candidates))]
+    pool = []
+    diagnostics = []
+    for index, example in enumerate(selected, start=1):
+        torch.manual_seed(seed + index)
+        _, _, completions, _ = generate_math_group(
+            model,
+            data,
+            example,
+            group_size,
+            max_new_tokens,
+            device,
+            temperature,
+        )
+        _, _, predictions = score_math_completions(
+            completions, example.answer, device
+        )
+        correct = sum(prediction == example.answer for prediction in predictions)
+        if 0 < correct < group_size:
+            pool.append(example)
+        diagnostics.append(
+            {
+                "question": example.question,
+                "answer": example.answer,
+                "difficulty": example.difficulty,
+                "operation": example.operation,
+                "correct_samples": correct,
+            }
+        )
+        if index % 16 == 0 or index == len(selected):
+            print(
+                f"GRPO prompt screening {index}/{len(selected)} | "
+                f"mixed pool {len(pool)}"
+            )
+    return pool, diagnostics
+
+
+def curriculum_candidates(
+    pool: list[MathExample], step: int, max_steps: int
+) -> list[MathExample]:
+    """Start with easy mixed prompts, then admit medium and hard prompts."""
+    progress = step / max(max_steps, 1)
+    allowed = (
+        {"easy"} if progress < 1 / 3
+        else {"easy", "medium"} if progress < 2 / 3
+        else {"easy", "medium", "hard", "unknown"}
+    )
+    candidates = [example for example in pool if example.difficulty in allowed]
+    return candidates or pool
 
 
 def freeze_routing(model: SparseMoEMTPTransformer) -> None:
@@ -107,9 +182,16 @@ def main() -> None:
     model, checkpoint = load_checkpoint(args.checkpoint, device)
     if not isinstance(model, SparseMoEMTPTransformer) or model.config.attention_type != "mla":
         raise ValueError("math GRPO requires the MLA+RoPE MoE+MTP checkpoint")
-    data = MathData(args.data_dir, model.config.context_length, seed=args.seed)
+    dataset_config = checkpoint.get("training_config", {}).get("dataset", {})
+    data = MathData(
+        args.data_dir,
+        model.config.context_length,
+        seed=args.seed,
+        tokenizer_type=dataset_config.get("tokenizer_type", "byte"),
+        bpe_vocab_size=int(dataset_config.get("bpe_vocab_size", 4096)),
+    )
     if checkpoint["stoi"] != data.stoi:
-        raise ValueError("checkpoint does not use the math byte tokenizer")
+        raise ValueError("checkpoint tokenizer does not match the math data tokenizer")
     reference = copy.deepcopy(model).to(device).eval()
     for parameter in reference.parameters():
         parameter.requires_grad_(False)
@@ -125,19 +207,23 @@ def main() -> None:
     (experiment_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
     logger = StructuredLogger(experiment_dir, FIELDS)
     config: dict[str, Any] = {
-        "stage": "math_quality_grpo",
+        "stage": "math_binary_correctness_grpo",
         "model": model.config.to_dict(),
+        "dataset": dataset_config,
         "grpo": vars(args),
         "reward": {
-            "exact_answer": 1.0,
-            "valid_answer_format": 0.10,
-            "numeric_closeness": 0.20,
-            "repeated_4gram_penalty": -0.20,
-            "compute_above_target": -0.10,
+            "exact_normalized_answer": 1.0,
+            "otherwise": 0.0,
+            "advantage": "(reward - group mean) / population standard deviation",
+            "tied_group_behavior": "all advantages are zero",
         },
         "frozen": "SkipLayer router, MoE selection routers, and reference policy",
         "optimized": "token policy/backbone, active experts, LM head, and MTP module",
         "regularization": "reference KL plus GSM8K supervised replay and MTP loss",
+        "prompt_curriculum": (
+            "separately screen mixed-outcome prompts; easy, then easy+medium, "
+            "then all difficulties"
+        ),
         "device": str(device),
     }
     write_json(experiment_dir / "config.json", config)
@@ -151,9 +237,41 @@ def main() -> None:
         f"device={device} quality-GRPO group={args.group_size} steps={args.max_steps} "
         f"trainable={sum(p.numel() for p in trainable):,}/{model.parameter_count():,}"
     )
+    mixed_pool, pool_diagnostics = build_mixed_prompt_pool(
+        model,
+        data,
+        eligible,
+        group_size=args.group_size,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        device=device,
+        count=args.prompt_screen_examples,
+        seed=args.seed + 20_000,
+    )
+    write_json(experiment_dir / "prompt_screening.json", pool_diagnostics)
+    if not mixed_pool:
+        logger.close()
+        raise RuntimeError(
+            "No separately screened training prompt produced both correct and "
+            "incorrect trajectories; GRPO has no binary advantage signal."
+        )
+    write_json(
+        experiment_dir / "mixed_prompt_pool.json",
+        [
+            {
+                "question": example.question,
+                "answer": example.answer,
+                "difficulty": example.difficulty,
+                "operation": example.operation,
+            }
+            for example in mixed_pool
+        ],
+    )
+    print(f"GRPO curriculum pool contains {len(mixed_pool)} mixed-outcome prompts")
     try:
         for step in range(args.max_steps):
-            example = rng.choice(eligible)
+            candidates = curriculum_candidates(mixed_pool, step, args.max_steps)
+            example = rng.choice(candidates)
             synchronize_device(device)
             started = time.perf_counter()
             token_ids, old_logp, completions, rollout_depth = generate_math_group(
@@ -167,7 +285,7 @@ def main() -> None:
             )
             compute = rollout_depth.mean(dim=1)
             rewards, reward_parts, predictions = score_math_completions(
-                completions, example.answer, compute, args.compute_target
+                completions, example.answer, device
             )
             advantages = group_relative_advantages(rewards[None]).squeeze(0).detach()
             prompt_length = token_ids.shape[1] - args.max_new_tokens
@@ -200,7 +318,9 @@ def main() -> None:
             ).sum(dim=-1).mean()
 
             model.train()
-            sft_x, sft_y = data.get_batch("mixed", 2, device)
+            sft_x, sft_y = data.get_supervised_batch(
+                "gsm_train", args.sft_batch_size, device
+            )
             sft = model(sft_x, sft_y, routing_mode="greedy")
             total = (
                 policy_loss
@@ -228,6 +348,9 @@ def main() -> None:
                 **reward_parts,
                 "group_exact_match": exact / args.group_size,
                 "group_parse_rate": parseable / args.group_size,
+                "mixed_group": float(0 < exact < args.group_size),
+                "curriculum_difficulty": example.difficulty,
+                "mixed_prompt_pool_size": len(mixed_pool),
                 "policy_loss": float(policy_loss.item()),
                 "kl_loss": float(kl_loss.item()),
                 "sft_loss": float(sft.lm_loss.item()),
@@ -279,7 +402,7 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens, seed=args.seed + 1,
     )
     summary = {
-        "stage": "math_quality_grpo",
+        "stage": "math_binary_correctness_grpo",
         **latest_eval,
         **answer_metrics,
         "samples": latest_samples,

@@ -27,6 +27,11 @@ def test_group_relative_advantages_are_normalized_per_group() -> None:
     )
 
 
+def test_group_relative_advantages_are_zero_when_rewards_are_tied() -> None:
+    advantages = group_relative_advantages(torch.zeros(2, 4))
+    torch.testing.assert_close(advantages, torch.zeros(2, 4))
+
+
 def test_clipped_objective_reports_clipping() -> None:
     old = torch.zeros(2)
     new = torch.log(torch.tensor([2.0, 0.5]))

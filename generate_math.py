@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 from math_data import MathData, MathExample, extract_tagged_answer
 from math_training_utils import generate_math_group
@@ -21,7 +22,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--checkpoint",
-        default="experiments/math_grpo_seed42/grpo/checkpoints/latest.pt",
+        default="experiments/math_v2_seed42/supervised/checkpoints/best_exact_match.pt",
     )
     parser.add_argument(
         "--question",
@@ -30,7 +31,7 @@ def main() -> None:
         help="Question to answer; repeat this option for multiple questions.",
     )
     parser.add_argument("--samples-per-question", type=int, default=1)
-    parser.add_argument("--max-new-tokens", type=int, default=48)
+    parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--data-dir", default="data/gsm8k")
@@ -39,14 +40,28 @@ def main() -> None:
     if args.samples_per_question < 1:
         parser.error("--samples-per-question must be positive")
 
+    checkpoint_path = Path(args.checkpoint)
+    if not checkpoint_path.exists() and checkpoint_path.name == "best_exact_match.pt":
+        fallback = checkpoint_path.with_name("best_val_loss.pt")
+        if fallback.exists():
+            checkpoint_path = fallback
     device = select_device(args.device)
     set_seed(args.seed)
-    model, checkpoint = load_checkpoint(args.checkpoint, device)
+    model, checkpoint = load_checkpoint(checkpoint_path, device)
     if not isinstance(model, SparseMoEMTPTransformer):
         raise ValueError("checkpoint is not the math SkipLayer+MoE+MTP model")
-    data = MathData(args.data_dir, model.config.context_length, seed=42)
+    dataset_config = checkpoint.get("training_config", {}).get("dataset", {})
+    if not dataset_config:
+        dataset_config = checkpoint.get("training_config", {}).get("source_dataset", {})
+    data = MathData(
+        args.data_dir,
+        model.config.context_length,
+        seed=42,
+        tokenizer_type=dataset_config.get("tokenizer_type", "byte"),
+        bpe_vocab_size=int(dataset_config.get("bpe_vocab_size", 4096)),
+    )
     if checkpoint["stoi"] != data.stoi:
-        raise ValueError("checkpoint does not use the byte-level math tokenizer")
+        raise ValueError("checkpoint tokenizer does not match the math data tokenizer")
 
     questions = args.questions or DEFAULT_QUESTIONS
     for question_index, question in enumerate(questions, start=1):
@@ -72,4 +87,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
