@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import torch
 
-from model import build_model
+from tiny_deepseek.core.model import build_model
 from tests.test_model import tiny_config
-from utils import load_checkpoint, save_checkpoint
+from tiny_deepseek.core.utils import load_checkpoint, save_checkpoint
 
 
 def test_checkpoint_restores_identical_greedy_logits(tmp_path) -> None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from report import report_markdown
+from tiny_deepseek.evaluation.report import report_markdown
 
 
 def test_paper_runs_generate_paper_specific_report(tmp_path) -> None:

@@ -36,7 +36,7 @@ cd MoR-with-Layer_Skipping
 
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install -r requirements.txt
+python -m pip install -e ".[dev]"
 ```
 
 Device selection uses CUDA first, Apple MPS second, and CPU otherwise. Pass
@@ -57,12 +57,12 @@ The math experiment increases model capacity while retaining the same components
 | Main decoder | 8 layers, width 256, 4 heads, FFN width 1024 |
 | Dropout | 0.05 |
 | Dynamic depth | Linear SkipLayer router; all eight layers forced on during SFT |
-| MoE | 4 experts per layer, top-2 active, expert width 512 |
+| Feed-forward variants | 4-expert top-2 MoE (expert width 512), or one dense FFN of width 1,024 |
 | Attention | MLA, KV latent rank 64 |
 | MLA heads | 32 content dimensions, 32 RoPE dimensions, 64 value dimensions |
 | Positions | RoPE with theta 10,000 |
 | MTP | One causal Transformer block predicting `t+2` |
-| Stored parameters | 11,764,560 |
+| Stored parameters | 11,764,560 with MoE; 7,547,728 with dense FFNs |
 
 The BPE tokenizer is trained only on the GSM8K training partition and synthetic
 training examples. Validation and test text never fit the tokenizer. Byte-level BPE
@@ -93,7 +93,7 @@ Reasoning: Add the two amounts: 17 + 8 = 25.
 ```
 
 The initial v2 run used 10,000 supervised steps. The capability-first continuation
-then processes 80,000 additional complete examples with an effective batch size of
+then processed 80,000 additional complete examples with an effective batch size of
 32. This is equivalent to 20,000 iterations at the original batch size of four:
 
 - Steps 0–999: synthetic arithmetic only.
@@ -115,14 +115,32 @@ Run the supervised pipeline and automatically start GRPO only if the readiness g
 passes:
 
 ```bash
-python run_math_grpo.py \
-  --root-dir experiments/math_v2_seed42 \
+python -m tiny_deepseek.workflows.run_math_grpo \
+  --root-dir artifacts/experiments/math_v2_seed42 \
   --sft-steps 12500 \
   --synthetic-steps 1000 \
   --grpo-steps 500 \
-  --resume-sft experiments/math_v2_seed42/supervised/checkpoints/latest.pt \
+  --resume-sft artifacts/experiments/math_v2_seed42/supervised/checkpoints/latest.pt \
   --device auto
 ```
+
+Run the directly comparable no-MoE ablation with the same active FFN width and
+training schedule:
+
+```bash
+python -m tiny_deepseek.training.math_sft \
+  --dense-ffn \
+  --experiment-dir artifacts/experiments/math_v2_seed42/dense_ffn_supervised \
+  --max-steps 12500 \
+  --synthetic-steps 1000 \
+  --defer-readiness \
+  --device auto
+```
+
+This keeps SkipLayer, MLA, RoPE, and the one-block MTP head but replaces every
+top-2 MoE with one ordinary width-1,024 FFN. Placing the output under the same
+`math_v2_seed42` directory makes the existing TensorBoard instance display the MoE
+and dense-FFN runs together.
 
 After SFT, the runner samples eight responses for each of 200 held-out validation
 problems. GRPO starts only if greedy exact match is at least 5%, parse rate is at
@@ -178,7 +196,7 @@ Start TensorBoard for both math stages:
 
 ```bash
 tensorboard \
-  --logdir /Users/yashsolanki/Desktop/layer-skipper/experiments/math_v2_seed42 \
+  --logdir /Users/yashsolanki/Desktop/layer-skipper/artifacts/experiments/math_v2_seed42 \
   --port 6008
 ```
 
@@ -208,13 +226,13 @@ If port 6007 is occupied, select another port and open that address instead.
 Run the built-in sample questions against the completed GRPO checkpoint:
 
 ```bash
-python generate_math.py --max-new-tokens 128 --device auto
+python -m tiny_deepseek.cli.generate_math --max-new-tokens 128 --device auto
 ```
 
 Supply one or more custom questions by repeating `--question`:
 
 ```bash
-python generate_math.py \
+python -m tiny_deepseek.cli.generate_math \
   --question "If a store has 25 books and sells 9, how many remain?" \
   --question "There are 8 boxes with 6 pencils in each. How many pencils are there?" \
   --question "Sarah has 30 dollars, spends 12, and earns 7 more. How much does she have?" \
@@ -226,7 +244,7 @@ python generate_math.py \
 Request several stochastic answers with:
 
 ```bash
-python generate_math.py \
+python -m tiny_deepseek.cli.generate_math \
   --question "What is 17 multiplied by 6?" \
   --samples-per-question 4 \
   --temperature 0.8 \
@@ -241,44 +259,46 @@ executed layers per generated token.
 
 ## Completed math results
 
-### BPE/full-depth v2 readiness run
+### BPE/full-depth capability continuation
 
-The 10,000-step run selected its best supervised checkpoint at step 8,400, then
-evaluated it at full eight-layer depth. The held-out pass@8 evaluation used 200 GSM8K
-validation problems and 1,600 sampled responses:
+The initial 10,000-step checkpoint was continued with the GSM8K-heavy curriculum and
+80,000 additional complete examples. Both evaluations ran at full eight-layer depth;
+the final pass@8 evaluation used 200 GSM8K validation problems and 1,600 sampled
+responses:
 
-| Metric | Result |
-|---|---:|
-| Parameters | 11,764,560 |
-| Validation response-token CE | 3.7237 |
-| Validation response-token accuracy | 36.59% |
-| MTP `t+2` accuracy | 38.00% |
-| Greedy exact match | 0/16 |
-| Greedy parse rate | 87.50% |
-| Sample-level exact match | 0.6875% (11/1,600) |
-| Sample parse rate | 72.38% |
-| pass@8 | 5.50% (11/200) |
-| Mixed correct/incorrect groups | 5.50% |
-| Executed layers/token | 8.0/8.0 |
-| Analytical FLOPs vs full dense | 0.9233× |
+| Metric | Initial 10k | Capability continuation |
+|---|---:|---:|
+| Parameters | 11,764,560 | 11,764,560 |
+| Validation response-token CE | 3.7237 | **2.7923** |
+| Validation response-token accuracy | 36.59% | **47.44%** |
+| MTP `t+2` accuracy | 38.00% | **48.30%** |
+| Greedy exact match | 0/16 | **3/64 (4.69%)** |
+| Greedy parse rate | 87.50% | **89.06%** |
+| Sample-level exact match | 0.6875% | **1.3125% (21/1,600)** |
+| Sample parse rate | 72.38% | **83.50%** |
+| pass@8 | 5.50% | **9.00% (18/200)** |
+| Mixed correct/incorrect groups | 5.50% | **9.00%** |
+| Executed layers/token | 8.0/8.0 | 8.0/8.0 |
+| Analytical FLOPs vs full dense | 0.9233× | 0.9233× |
 
-The readiness thresholds were 10% pass@8 and 10% mixed groups. Both observed values
-were 5.5%, so the orchestrator correctly stopped before GRPO. This is a conclusive
-negative readiness result, not a completed v2 RL result: the model still produces too
-few correct samples for strict binary group-relative advantages to provide a stable
-signal. The checkpoint, all 200 rollout groups, summary JSON, and TensorBoard scalars
-remain under `experiments/math_v2_seed42/supervised/`.
+The final readiness thresholds were 5% greedy exact match, 95% parse rate, 20% pass@8,
+and 15% mixed groups. The final values were 4.69%, 89.06%, 9%, and 9%, respectively,
+so the orchestrator correctly stopped before GRPO. The continuation substantially
+improved token metrics and sampled correctness, but it still did not produce enough
+correct trajectories for stable binary-reward GRPO. The selected checkpoint, all 200
+rollout groups, summary JSON, and TensorBoard scalars remain under
+`artifacts/experiments/math_v2_seed42/supervised/`.
 
-The validation CE above comes from the final fixed 20-batch readiness evaluation. The
-lowest periodic training-validation estimate was 3.4547 at step 8,400; the estimates
-use different sampled validation batches and should not be compared as identical
-measurements.
+The validation CE above comes from the final fixed 20-batch readiness evaluation.
+Periodic training validation uses freshly sampled batches, while checkpoint selection
+uses the fixed greedy-answer set; those measurements should not be treated as
+identical evaluations.
 
 To reproduce only the readiness evaluation:
 
 ```bash
-python evaluate_math_readiness.py \
-  --checkpoint experiments/math_v2_seed42/supervised/checkpoints/best_val_loss.pt \
+python -m tiny_deepseek.cli.evaluate_math_readiness \
+  --checkpoint artifacts/experiments/math_v2_seed42/supervised/checkpoints/best_exact_match.pt \
   --pass-examples 200 \
   --pass-k 8 \
   --max-new-tokens 128 \
@@ -334,16 +354,16 @@ Quality GRPO: <answer>1</answer>
 Complete matched samples and raw values are generated at:
 
 ```text
-results/math_grpo_seed42/REPORT.md
-results/math_grpo_seed42/results.json
-experiments/math_binary_grpo_seed42/grpo/summary.json
-experiments/math_binary_grpo_seed42/grpo/training_metrics.csv
+artifacts/results/math_grpo_seed42/REPORT.md
+artifacts/results/math_grpo_seed42/results.json
+artifacts/experiments/math_binary_grpo_seed42/grpo/summary.json
+artifacts/experiments/math_binary_grpo_seed42/grpo/training_metrics.csv
 ```
 
 To regenerate the matched final report from saved checkpoints:
 
 ```bash
-python finalize_math_grpo.py --device auto
+python -m tiny_deepseek.workflows.finalize_math_grpo --device auto
 ```
 
 ## Shakespeare quality and compute results
@@ -363,7 +383,7 @@ short run.
 Run the Shakespeare MoE/MTP/MLA experiment with:
 
 ```bash
-python run_skiplayer_moe_mtp.py \
+python -m tiny_deepseek.workflows.run_skiplayer_moe_mtp \
   --supervised-steps 250 \
   --grpo-steps 120 \
   --eval-iters 10 \
@@ -381,8 +401,8 @@ distribution.
 Benchmark the Shakespeare MLA+RoPE checkpoint and generate samples with:
 
 ```bash
-python speculative_decode.py \
-  --checkpoint experiments/skiplayer_moe_mtp_mla_rope_seed42/grpo/checkpoints/best_quality_compute.pt \
+python -m tiny_deepseek.cli.speculative_decode \
+  --checkpoint artifacts/experiments/skiplayer_moe_mtp_mla_rope_seed42/grpo/checkpoints/best_quality_compute.pt \
   --benchmark-tokens 96 \
   --benchmark-repeats 3 \
   --sample-tokens 80 \
@@ -423,10 +443,10 @@ same rankings or savings transfer directly to LLM scale.
 Run the complete suite with:
 
 ```bash
-pytest -q
+python -m pytest -q
 ```
 
-The current suite contains 59 tests covering routing semantics, checkpoints, GRPO
+The current suite contains 60 tests covering routing semantics, checkpoints, GRPO
 objectives, MoR, MoE accounting, MLA/RoPE, MTP, speculative residual sampling, math
 tokenization and persistence, length-bucketed token-budgeted batching,
 complete-example response masking, curriculum staging, cached MLA decoding,
@@ -434,24 +454,30 @@ numerical answer parsing, deterministic synthetic data, and reward ordering.
 
 ## Repository map
 
-| Files | Purpose |
-|---|---|
-| `model.py`, `config.py`, `router.py` | Transformer, MLA, MoE, MTP, depth routing, and configuration |
-| `math_data.py` | GSM8K download, persistent BPE/legacy byte tokenizers, complete-example batching, deterministic splits, and synthetic curriculum |
-| `train_math.py` | Arithmetic/GSM8K supervised training |
-| `train_math_grpo.py` | Token-policy quality GRPO with exact numerical rewards |
-| `math_training_utils.py` | Cached math rollouts, pass@k/readiness evaluation, rewards, validation, and generation metrics |
-| `evaluate_math_readiness.py` | 200-problem pass@8 gate before binary GRPO |
-| `generate_math.py` | Interactive command-line math generation |
-| `run_math_grpo.py` | End-to-end supervised + GRPO orchestration |
-| `finalize_math_grpo.py` | Matched checkpoint evaluation and final report generation |
-| `speculative_decode.py` | One-block MTP speculative decoding and latency benchmark |
-| `train.py`, `train_grpo.py`, `train_paper_grpo.py` | Dense/SkipLayer supervised and routing-GRPO training |
-| `train_moe_mtp.py`, `run_skiplayer_moe_mtp.py` | Shakespeare MoE/MTP/MLA adaptation and orchestration |
-| `train_mor_grpo.py`, `train_mor_skip.py`, `train_mor_skip_grpo.py` | MoR and hybrid training |
-| `evaluation.py`, `evaluate.py`, `report.py`, `plots.py` | Evaluation and reporting |
-| `logging_utils.py` | CSV and TensorBoard logging |
-| `tests/` | Automated correctness tests |
+```text
+tiny_deepseek/
+├── core/        # Models, routing, losses, optimizers, checkpoints
+├── data/        # Tiny Shakespeare and GSM8K data pipelines
+├── training/    # Supervised, GRPO, MoR, MoE, and MTP trainers
+├── evaluation/  # Metrics, analysis, aggregation, plots, reports
+├── workflows/   # End-to-end reproducible experiment runners
+└── cli/         # Generation, evaluation, benchmarks, visualization
+tests/             # Automated correctness tests
+data/              # Versioned input datasets and generated tokenizer cache
+artifacts/         # Ignored checkpoints, TensorBoard logs, plots, and run outputs
+README.md          # Architecture, commands, results, and limitations
+docs/PAPER_REPRODUCTION.md
+requirements.txt
+pyproject.toml      # Package metadata and installed command entry points
+```
+
+All executable commands use Python modules, for example:
+
+```bash
+python -m tiny_deepseek.training.math_sft --help
+python -m tiny_deepseek.workflows.run_math_grpo --help
+python -m tiny_deepseek.cli.generate_math --help
+```
 
 ## Experimental limitations
 

@@ -1,8 +1,10 @@
 __pycache__/
 .pytest_cache/
 .venv/
+*.egg-info/
+build/
+dist/
 data/input.txt
-runs/
 checkpoints/
 *.pt
 *.png
@@ -10,9 +12,7 @@ results.csv
 benchmark.csv
 
 # Generated artifacts
-experiments/
-results/
-tmp/
+artifacts/
 *.html
 *.pdf
 *.csv

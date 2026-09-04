@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from losses import (
+from tiny_deepseek.core.losses import (
     clipped_grpo_loss,
     clipped_grpo_loss_per_decision,
     grpo_reward,

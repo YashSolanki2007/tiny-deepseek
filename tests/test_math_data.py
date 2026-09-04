@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import pytest
 
-from math_data import (
+from tiny_deepseek.data.math import (
     ByteTokenizer,
     MathData,
     MathBPETokenizer,
@@ -12,7 +12,7 @@ from math_data import (
     generate_synthetic_examples,
     normalize_numeric_answer,
 )
-from math_training_utils import score_math_completions
+from tiny_deepseek.training.math_utils import score_math_completions
 
 
 def test_byte_tokenizer_round_trip_handles_unseen_unicode() -> None:

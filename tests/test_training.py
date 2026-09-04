@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import torch
 
-from losses import density_loss, scheduled_coefficient
-from math_data import MathExample
-from train_math import curriculum_source
-from train_math_grpo import curriculum_candidates
+from tiny_deepseek.core.losses import density_loss, scheduled_coefficient
+from tiny_deepseek.data.math import MathExample
+from tiny_deepseek.training.math_grpo import curriculum_candidates
+from tiny_deepseek.training.math_sft import curriculum_source
 
 
 def test_density_schedule() -> None:

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tiny-deepseek"
+version = "0.1.0"
+description = "Research implementation of dynamic-depth Transformers, MoE, MTP, MLA, and GRPO."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "matplotlib>=3.7",
+  "numpy>=1.24",
+  "tensorboard>=2.14",
+  "tokenizers>=0.20",
+  "torch>=2.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+tiny-deepseek-evaluate = "tiny_deepseek.cli.evaluate:main"
+tiny-deepseek-generate = "tiny_deepseek.cli.generate:main"
+tiny-deepseek-math = "tiny_deepseek.cli.generate_math:main"
+tiny-deepseek-math-train = "tiny_deepseek.training.math_sft:main"
+tiny-deepseek-math-workflow = "tiny_deepseek.workflows.run_math_grpo:main"
+
+[tool.setuptools.packages.find]
+include = ["tiny_deepseek*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

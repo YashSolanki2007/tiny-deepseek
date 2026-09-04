@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from model import build_model
+from tiny_deepseek.core.model import build_model
 from tests.test_model import tiny_config
 
 

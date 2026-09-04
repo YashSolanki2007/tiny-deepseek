@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from aggregate_results import grouping_value
+from tiny_deepseek.evaluation.aggregation import grouping_value
 
 
 def test_missing_group_keys_share_stable_value() -> None:

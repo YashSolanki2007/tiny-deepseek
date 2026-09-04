@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import torch
 
-from config import ModelConfig
-from model import SparseMoEMTPTransformer, build_model
-from speculative_decode import (
+from tiny_deepseek.core.config import ModelConfig
+from tiny_deepseek.core.model import SparseMoEMTPTransformer, build_model
+from tiny_deepseek.cli.speculative_decode import (
     residual_distribution,
     sampling_distribution,
     speculative_generate,
@@ -77,4 +77,3 @@ def test_speculative_generation_returns_requested_length_and_accounting() -> Non
     )
     assert 0.0 <= stats["acceptance_rate"] <= 1.0
     assert stats["target_forward_calls"] >= 1
-

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import torch
 
-from config import ModelConfig
-from model import MultiHeadLatentAttention, TransformerBlock, apply_block_gate, build_model
-from utils import estimate_dense_block_flops, estimate_mor_flops, estimate_mor_skip_flops
+from tiny_deepseek.core.config import ModelConfig
+from tiny_deepseek.core.model import MultiHeadLatentAttention, TransformerBlock, apply_block_gate, build_model
+from tiny_deepseek.core.utils import estimate_dense_block_flops, estimate_mor_flops, estimate_mor_skip_flops
 
 
 def tiny_config(**overrides) -> ModelConfig:
@@ -112,6 +112,23 @@ def test_mla_variant_replaces_absolute_positions_and_runs_mtp() -> None:
     assert output.logits.shape == (2, config.context_length, config.vocab_size)
     assert output.mtp_logits.shape == (2, config.context_length - 1, config.vocab_size)
     assert torch.isfinite(output.logits).all()
+
+
+def test_dense_ffn_mla_variant_keeps_skipping_and_mtp_without_experts() -> None:
+    config = tiny_config(
+        model_type="sparse_mtp_mla", router_type="linear", d_ff=32,
+    )
+    model = build_model(config).eval()
+    assert model.position_embedding is None
+    assert isinstance(model.blocks[0].attn, MultiHeadLatentAttention)
+    assert not hasattr(model.blocks[0].mlp, "experts")
+    token_ids = torch.randint(0, config.vocab_size, (2, config.context_length))
+    output = model(token_ids, token_ids, routing_mode="greedy")
+    assert output.mtp_logits.shape == (2, config.context_length - 1, config.vocab_size)
+    assert output.hard_gates.shape == (2, config.context_length, config.n_layers)
+    assert output.expert_utilization is None
+    assert output.moe_aux_loss is None
+    assert torch.isfinite(output.lm_loss)
 
 
 def test_mla_full_depth_kv_cache_matches_full_prefix_logits() -> None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from optimizers import FixedDecayAdafactor
+from tiny_deepseek.core.optimizers import FixedDecayAdafactor
 
 
 def test_fixed_decay_adafactor_updates_matrix_and_vector_parameters() -> None:
